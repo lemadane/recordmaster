@@ -28,6 +28,32 @@ RecordMaster is organized as a multi-module Gradle project:
 
 ---
 
+## ⚙️ Installation (via JitPack)
+
+To import RecordMaster as a dependency in your Gradle project:
+
+1. Add the JitPack repository to your `settings.gradle` or `build.gradle`:
+```groovy
+repositories {
+    mavenCentral()
+    maven { url 'https://jitpack.io' }
+}
+```
+
+2. Add the core and annotation processor dependencies to your project's `build.gradle`:
+```groovy
+dependencies {
+    // Core Engine
+    implementation 'com.github.lemadane.recordmaster:recordmaster-core:main-SNAPSHOT'
+    
+    // Metamodel Annotation Processor
+    annotationProcessor 'com.github.lemadane.recordmaster:recordmaster-processor:main-SNAPSHOT'
+}
+```
+*(Replace `main-SNAPSHOT` with a specific release tag or git commit hash for production stability).*
+
+---
+
 ## ⚡ Quick Start
 
 ```java
