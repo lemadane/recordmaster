@@ -6,7 +6,7 @@ It guarantees **transaction rollback** as a first-class feature, supports **read
 
 ---
 
-## 🚀 Key Features
+## Key Features
 
 * **Java Record Persistence**: Native type-safe CRUD operations working directly on standard Java `record` objects.
 * **First-Class Transaction Engine**: Supports explicit `rollback()`, rollback-only states (`setRollbackOnly()`), automatic rollback on callback exceptions, and manual transaction blocks.
@@ -18,7 +18,7 @@ It guarantees **transaction rollback** as a first-class feature, supports **read
 
 ---
 
-## 📦 Project Structure
+## Project Structure
 
 RecordMaster is organized as a multi-module Gradle project:
 * [`recordmaster-core`](file:///home/lem/Projects/java/recordmaster/recordmaster-core/): The database engine, including codec, WAL manager, recovery parser, and SQL migrator.
@@ -28,7 +28,7 @@ RecordMaster is organized as a multi-module Gradle project:
 
 ---
 
-## ⚙️ Installation (via JitPack)
+## Installation (via JitPack)
 
 To import RecordMaster as a dependency in your Gradle project:
 
@@ -54,7 +54,7 @@ dependencies {
 
 ---
 
-## ⚡ Quick Start
+## Quick Start
 
 ```java
 import io.succinct.recordmaster.*;
@@ -95,7 +95,7 @@ db.transaction(tx -> {
 
 ---
 
-## 🧠 Handling Relational Joins & Analytics
+## Handling Relational Joins & Analytics
 
 Since RecordMaster is a transactional key-value/object store rather than a full SQL relational engine, it does not include a native SQL query optimizer. We address complex queries, joins, and analytics through three features:
 
@@ -130,7 +130,7 @@ SqlMigrator.migrate(db, conn, SqlDialect.POSTGRESQL);
 
 ---
 
-## 🛠️ Build and Verification
+## Build and Verification
 
 To build and run all automated tests (unit and integration tests) using Java 21:
 
@@ -155,6 +155,6 @@ Populates RecordMaster with records (including a nested `Address` record inside 
 
 ---
 
-## 📜 License
+## License
 
 RecordMaster is licensed under the [MIT License](file:///home/lem/Projects/java/recordmaster/LICENSE).
