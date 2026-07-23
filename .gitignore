@@ -1,0 +1,23 @@
+# Gradle directories
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# IDE specific files
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+bin/
+
+# Local databases and runtime logs
+data/
+wal.log
+snapshot.*
+*.db
+
+# Operating System files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,5 @@
+rootProject.name = 'recordmaster'
+include 'recordmaster-core'
+include 'recordmaster-processor'
+include 'recordmaster-demo'
+include 'recordmaster-sqlite-demo'

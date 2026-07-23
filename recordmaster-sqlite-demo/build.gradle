@@ -1,0 +1,23 @@
+plugins {
+    id 'java'
+    id 'application'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation project(':recordmaster-core')
+    implementation 'org.xerial:sqlite-jdbc:3.45.3.0'
+}
+
+application {
+    mainClass = 'io.succinct.recordmaster.demo.sqlite.SqliteDemoApplication'
+}
