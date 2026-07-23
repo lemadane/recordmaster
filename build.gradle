@@ -1,5 +1,5 @@
 allprojects {
-    group = 'io.succinct.recordmaster'
+    group = 'io.lemadane.recordmaster'
     version = '1.0.0'
 
     repositories {

@@ -19,5 +19,5 @@ dependencies {
 }
 
 application {
-    mainClass = 'io.succinct.recordmaster.demo.sqlite.SqliteDemoApplication'
+    mainClass = 'io.lemadane.recordmaster.demo.sqlite.SqliteDemoApplication'
 }

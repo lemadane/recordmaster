@@ -57,7 +57,7 @@ dependencies {
 ## Quick Start
 
 ```java
-import io.succinct.recordmaster.*;
+import io.lemadane.recordmaster.*;
 import java.nio.file.Path;
 import java.util.UUID;
 import java.time.Instant;
