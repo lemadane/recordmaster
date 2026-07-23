@@ -86,13 +86,29 @@ public final class RecordTableImpl<ID, T extends io.succinct.recordmaster.Record
             }
             TableState committed = getTableState(tx);
             if (committed != null) {
-                return Optional.ofNullable((T) committed.records().get(id));
+                RecordPointer ptr = committed.recordPointers().get(id);
+                if (ptr != null) {
+                    try {
+                        byte[] bytes = db.getTableStorage(tableName).readRecord(ptr);
+                        return Optional.of((T) BinaryCodec.deserialize(bytes, entityType));
+                    } catch (Exception e) {
+                        throw new RecordMasterException("Failed to read record from disk", e);
+                    }
+                }
             }
             return Optional.empty();
         } else {
             TableState committed = db.getCommittedState().getTable(tableName);
             if (committed != null) {
-                return Optional.ofNullable((T) committed.records().get(id));
+                RecordPointer ptr = committed.recordPointers().get(id);
+                if (ptr != null) {
+                    try {
+                        byte[] bytes = db.getTableStorage(tableName).readRecord(ptr);
+                        return Optional.of((T) BinaryCodec.deserialize(bytes, entityType));
+                    } catch (Exception e) {
+                        throw new RecordMasterException("Failed to read record from disk", e);
+                    }
+                }
             }
             return Optional.empty();
         }
@@ -114,7 +130,7 @@ public final class RecordTableImpl<ID, T extends io.succinct.recordmaster.Record
                 exists = true;
             } else if (!cs.isCleared() && !cs.getDeletes().contains(id)) {
                 TableState committed = getTableState(tx);
-                if (committed != null && committed.records().containsKey(id)) {
+                if (committed != null && committed.recordPointers().containsKey(id)) {
                     exists = true;
                 }
             }
@@ -156,7 +172,15 @@ public final class RecordTableImpl<ID, T extends io.succinct.recordmaster.Record
             } else if (!cs.isCleared() && !cs.getDeletes().contains(id)) {
                 TableState committed = getTableState(tx);
                 if (committed != null) {
-                    oldRecord = (T) committed.records().get(id);
+                    RecordPointer ptr = committed.recordPointers().get(id);
+                    if (ptr != null) {
+                        try {
+                            byte[] bytes = db.getTableStorage(tableName).readRecord(ptr);
+                            oldRecord = (T) BinaryCodec.deserialize(bytes, entityType);
+                        } catch (Exception e) {
+                            throw new RecordMasterException("Failed to read record from disk", e);
+                        }
+                    }
                 }
             }
 
@@ -187,6 +211,7 @@ public final class RecordTableImpl<ID, T extends io.succinct.recordmaster.Record
     }
 
     @Override
+    @SuppressWarnings("unchecked")
     public T upsert(T record) {
         if (record == null) throw new IllegalArgumentException("Record cannot be null");
         ID id = idExtractor.apply(record);
@@ -200,7 +225,7 @@ public final class RecordTableImpl<ID, T extends io.succinct.recordmaster.Record
                 exists = true;
             } else if (!cs.isCleared() && !cs.getDeletes().contains(id)) {
                 TableState committed = getTableState(tx);
-                if (committed != null && committed.records().containsKey(id)) {
+                if (committed != null && committed.recordPointers().containsKey(id)) {
                     exists = true;
                 }
             }
@@ -216,6 +241,7 @@ public final class RecordTableImpl<ID, T extends io.succinct.recordmaster.Record
     }
 
     @Override
+    @SuppressWarnings("unchecked")
     public boolean deleteById(ID id) {
         if (id == null) return false;
         RecordTransactionImpl tx = getActiveTransaction();
@@ -232,9 +258,17 @@ public final class RecordTableImpl<ID, T extends io.succinct.recordmaster.Record
                 present = true;
             } else if (!cs.isCleared() && !cs.getDeletes().contains(id)) {
                 TableState committed = getTableState(tx);
-                if (committed != null && committed.records().containsKey(id)) {
-                    oldRecord = (T) committed.records().get(id);
-                    present = true;
+                if (committed != null) {
+                    RecordPointer ptr = committed.recordPointers().get(id);
+                    if (ptr != null) {
+                        try {
+                            byte[] bytes = db.getTableStorage(tableName).readRecord(ptr);
+                            oldRecord = (T) BinaryCodec.deserialize(bytes, entityType);
+                            present = true;
+                        } catch (Exception e) {
+                            throw new RecordMasterException("Failed to read record from disk", e);
+                        }
+                    }
                 }
             }
 
@@ -279,10 +313,10 @@ public final class RecordTableImpl<ID, T extends io.succinct.recordmaster.Record
             TableState committed = getTableState(tx);
             TableChangeSet cs = tx.getChangeSet().getTableChanges(tableName);
             IndexChangeSet ics = tx.getChangeSet().getIndexChanges();
-            return new QueryEngine<>(tableName, committed, cs, ics);
+            return new QueryEngine<>(tableName, committed, cs, ics, db);
         } else {
             TableState committed = db.getCommittedState().getTable(tableName);
-            return new QueryEngine<>(tableName, committed, null, null);
+            return new QueryEngine<>(tableName, committed, null, null, db);
         }
     }
 }

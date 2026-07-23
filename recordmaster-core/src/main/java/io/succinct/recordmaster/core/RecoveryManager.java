@@ -7,8 +7,13 @@ import java.util.function.Function;
 
 public final class RecoveryManager {
 
+    public interface RecoveryStorageHelper {
+        Record readRecord(String tableName, Object id, RecordPointer ptr, Class<? extends Record> type) throws Exception;
+        RecordPointer appendRecord(String tableName, Record record, byte[] bytes) throws Exception;
+    }
+
     @SuppressWarnings("unchecked")
-    public static DatabaseState recover(DatabaseState initialState, List<WalRecord> walRecords) throws Exception {
+    public static DatabaseState recover(DatabaseState initialState, List<WalRecord> walRecords, RecoveryStorageHelper helper) throws Exception {
         if (walRecords.isEmpty()) {
             return initialState != null ? initialState : new DatabaseState(0);
         }
@@ -30,7 +35,7 @@ public final class RecoveryManager {
         // We only replay transactions that have committed and not rolled back.
         committedTxIds.removeAll(rolledBackTxIds);
 
-        // Sort committed transactions by their generation (using the generation of their COMMIT record, or the first record)
+        // Sort committed transactions by their generation
         List<Long> sortedTxIds = new ArrayList<>(committedTxIds);
         sortedTxIds.sort(Comparator.comparingLong(txId -> {
             List<WalRecord> recs = txGroups.get(txId);
@@ -75,11 +80,17 @@ public final class RecoveryManager {
                             }
 
                             Object id = ts.idExtractor().apply(record);
-                            Record oldRecord = ts.records().get(id);
+                            RecordPointer oldPtr = ts.recordPointers().get(id);
+                            Record oldRecord = null;
+                            if (oldPtr != null) {
+                                oldRecord = helper.readRecord(tableName, id, oldPtr, entityType);
+                            }
+
+                            RecordPointer ptr = helper.appendRecord(tableName, record, recBytes);
                             if (rec.type() == RecordWalOperation.INSERT) {
-                                ts.insert(record);
+                                ts.insert(record, ptr);
                             } else {
-                                ts.update(record, oldRecord);
+                                ts.update(record, oldRecord, ptr);
                             }
                             break;
                         }
@@ -90,7 +101,12 @@ public final class RecoveryManager {
 
                             TableState ts = dbState.getTable(tableName);
                             if (ts != null) {
-                                ts.delete(key);
+                                RecordPointer oldPtr = ts.recordPointers().get(key);
+                                Record oldRecord = null;
+                                if (oldPtr != null) {
+                                    oldRecord = helper.readRecord(tableName, key, oldPtr, ts.entityType());
+                                }
+                                ts.delete(key, oldRecord);
                             }
                             break;
                         }
@@ -145,8 +161,9 @@ public final class RecoveryManager {
 
                                 // Re-populate index for existing records
                                 IndexState idxState = ts.indexes().get(idxName);
-                                for (Map.Entry<Object, Record> entry : ts.records().entrySet()) {
-                                    Object val = extractor.apply(entry.getValue());
+                                for (Map.Entry<Object, RecordPointer> entry : ts.recordPointers().entrySet()) {
+                                    Record record = helper.readRecord(tableName, entry.getKey(), entry.getValue(), ts.entityType());
+                                    Object val = extractor.apply(record);
                                     idxState.add(val, entry.getKey());
                                 }
                             }

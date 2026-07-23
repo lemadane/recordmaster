@@ -2,11 +2,12 @@ package io.succinct.recordmaster.core;
 
 import io.succinct.recordmaster.DuplicateIndexValueException;
 import io.succinct.recordmaster.Record;
+import io.succinct.recordmaster.RecordDatabase;
 import java.util.*;
 
 public final class UniqueIndexValidator {
 
-    public static void validate(DatabaseState committedDbState, TransactionChangeSet changeSet) {
+    public static void validate(RecordDatabase db, DatabaseState committedDbState, TransactionChangeSet changeSet) {
         for (Map.Entry<String, TableChangeSet> tableEntry : changeSet.getAllTableChanges().entrySet()) {
             String tableName = tableEntry.getKey();
             TableChangeSet tableChanges = tableEntry.getValue();
@@ -34,21 +35,33 @@ public final class UniqueIndexValidator {
                 }
 
                 for (Object key : tableChanges.getDeletes()) {
-                    Record committedRecord = committedTable.records().get(key);
-                    if (committedRecord != null) {
-                        Object indexVal = meta.extractor().apply(committedRecord);
-                        if (indexVal != null) {
-                            finalUniqueMap.remove(indexVal);
+                    RecordPointer ptr = committedTable.recordPointers().get(key);
+                    if (ptr != null) {
+                        try {
+                            byte[] bytes = db.getTableStorage(tableName).readRecord(ptr);
+                            Record committedRecord = BinaryCodec.deserialize(bytes, committedTable.entityType());
+                            Object indexVal = meta.extractor().apply(committedRecord);
+                            if (indexVal != null) {
+                                finalUniqueMap.remove(indexVal);
+                            }
+                        } catch (Exception e) {
+                            throw new RuntimeException("Failed to read record for unique index validation", e);
                         }
                     }
                 }
 
                 for (Object key : tableChanges.getUpdates().keySet()) {
-                    Record committedRecord = committedTable.records().get(key);
-                    if (committedRecord != null) {
-                        Object indexVal = meta.extractor().apply(committedRecord);
-                        if (indexVal != null) {
-                            finalUniqueMap.remove(indexVal);
+                    RecordPointer ptr = committedTable.recordPointers().get(key);
+                    if (ptr != null) {
+                        try {
+                            byte[] bytes = db.getTableStorage(tableName).readRecord(ptr);
+                            Record committedRecord = BinaryCodec.deserialize(bytes, committedTable.entityType());
+                            Object indexVal = meta.extractor().apply(committedRecord);
+                            if (indexVal != null) {
+                                finalUniqueMap.remove(indexVal);
+                            }
+                        } catch (Exception e) {
+                            throw new RuntimeException("Failed to read record for unique index validation", e);
                         }
                     }
                 }

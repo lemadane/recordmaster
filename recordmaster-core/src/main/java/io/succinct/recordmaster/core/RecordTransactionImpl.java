@@ -4,7 +4,6 @@ import io.succinct.recordmaster.*;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.util.*;
-import java.util.function.Function;
 
 public final class RecordTransactionImpl implements RecordTransaction {
 
@@ -13,7 +12,6 @@ public final class RecordTransactionImpl implements RecordTransaction {
     private final DatabaseState committedDbState;
     private final TransactionChangeSet changeSet;
     private volatile TransactionStatus status;
-    private boolean lockReleased = false;
 
     public RecordTransactionImpl(long txId, RecordDatabase db, DatabaseState committedDbState) {
         this.txId = txId;
@@ -23,17 +21,17 @@ public final class RecordTransactionImpl implements RecordTransaction {
         this.status = TransactionStatus.ACTIVE;
     }
 
-    public TransactionChangeSet getChangeSet() {
-        return changeSet;
+    @Override
+    public long transactionId() {
+        return txId;
     }
 
     public DatabaseState getCommittedDbState() {
         return committedDbState;
     }
 
-    @Override
-    public long transactionId() {
-        return txId;
+    public TransactionChangeSet getChangeSet() {
+        return changeSet;
     }
 
     @Override
@@ -47,24 +45,8 @@ public final class RecordTransactionImpl implements RecordTransaction {
     }
 
     @Override
-    public boolean isCommitted() {
-        return status == TransactionStatus.COMMITTED;
-    }
-
-    @Override
-    public boolean isRolledBack() {
-        return status == TransactionStatus.ROLLED_BACK;
-    }
-
-    @Override
-    public boolean isRollbackOnly() {
-        return changeSet.isRollbackOnly();
-    }
-
-    @Override
     public void setRollbackOnly() {
-        checkActive();
-        changeSet.setRollbackOnly(true);
+        setRollbackOnly("Explicitly set rollback-only");
     }
 
     @Override
@@ -74,18 +56,12 @@ public final class RecordTransactionImpl implements RecordTransaction {
     }
 
     @Override
-    public Optional<String> rollbackReason() {
-        return Optional.ofNullable(changeSet.getRollbackReason());
-    }
-
-    private void checkActive() {
-        if (status != TransactionStatus.ACTIVE) {
-            throw new InvalidTransactionStateException("Transaction " + txId + " is not active (current status: " + status + ")");
-        }
+    public boolean isRollbackOnly() {
+        checkActive();
+        return changeSet.isRollbackOnly();
     }
 
     @Override
-    @SuppressWarnings("unchecked")
     public <ID, T extends io.succinct.recordmaster.Record> RecordTable<ID, T> table(Class<T> entityType) {
         checkActive();
         return db.resolveTableForTransaction(entityType, this);
@@ -93,10 +69,42 @@ public final class RecordTransactionImpl implements RecordTransaction {
 
     @Override
     public <ID, T extends io.succinct.recordmaster.Record> RecordTable<ID, T> table(
-            String tableName, Class<ID> idType, Class<T> entityType, Function<T, ID> idExtractor) {
+            String tableName, Class<ID> idType, Class<T> entityType, java.util.function.Function<T, ID> idExtractor) {
         checkActive();
         db.registerTableMetadata(tableName, idType, entityType, idExtractor);
         return new RecordTableImpl<>(tableName, idType, entityType, idExtractor, db, this);
+    }
+
+    private void checkActive() {
+        if (status != TransactionStatus.ACTIVE) {
+            throw new InvalidTransactionStateException("Transaction is not active (status: " + status + ")");
+        }
+    }
+
+    private void releaseWriterLock() {
+        db.releaseWriterLock();
+    }
+
+    @Override
+    public void rollback() {
+        if (status == TransactionStatus.ROLLED_BACK) {
+            return; // Idempotent
+        }
+        if (status == TransactionStatus.COMMITTED) {
+            throw new InvalidTransactionStateException("Cannot rollback: Transaction is already committed");
+        }
+        
+        status = TransactionStatus.ROLLING_BACK;
+        try {
+            long nextGen = db.currentGeneration() + 1;
+            db.getWalManager().appendRollbackMarker(txId, nextGen, changeSet.getRollbackReason());
+            status = TransactionStatus.ROLLED_BACK;
+        } catch (Exception e) {
+            status = TransactionStatus.FAILED;
+            throw new RecordMasterException("Failed to append rollback to WAL", e);
+        } finally {
+            releaseWriterLock();
+        }
     }
 
     @Override
@@ -118,7 +126,7 @@ public final class RecordTransactionImpl implements RecordTransaction {
         long nextGen = db.currentGeneration() + 1;
 
         try {
-            UniqueIndexValidator.validate(committedDbState, changeSet);
+            UniqueIndexValidator.validate(db, committedDbState, changeSet);
 
             List<WalRecord> walRecords = new ArrayList<>();
             for (Map.Entry<String, TableChangeSet> entry : changeSet.getAllTableChanges().entrySet()) {
@@ -181,17 +189,32 @@ public final class RecordTransactionImpl implements RecordTransaction {
                 String tableName = entry.getKey();
                 TableChangeSet tc = entry.getValue();
                 TableState ts = nextState.getTable(tableName);
+                TableStorage storage = db.getTableStorage(tableName);
 
                 if (tc.isCleared()) {
                     ts.clear();
                 }
 
                 for (Object key : tc.getDeletes()) {
-                    ts.delete(key);
+                    TableState oldTableState = committedDbState.getTable(tableName);
+                    if (oldTableState == null) {
+                        oldTableState = db.getCommittedState().getTable(tableName);
+                    }
+                    io.succinct.recordmaster.Record oldRecord = null;
+                    if (oldTableState != null) {
+                        RecordPointer oldPtr = oldTableState.recordPointers().get(key);
+                        if (oldPtr != null) {
+                            byte[] bytes = storage.readRecord(oldPtr);
+                            oldRecord = BinaryCodec.deserialize(bytes, oldTableState.entityType());
+                        }
+                    }
+                    ts.delete(key, oldRecord);
                 }
 
                 for (io.succinct.recordmaster.Record record : tc.getInserts().values()) {
-                    ts.insert(record);
+                    byte[] bytes = BinaryCodec.serialize(record);
+                    RecordPointer ptr = storage.appendRecord(bytes);
+                    ts.insert(record, ptr);
                 }
 
                 for (io.succinct.recordmaster.Record record : tc.getUpdates().values()) {
@@ -200,8 +223,17 @@ public final class RecordTransactionImpl implements RecordTransaction {
                     if (oldTableState == null) {
                         oldTableState = db.getCommittedState().getTable(tableName);
                     }
-                    io.succinct.recordmaster.Record oldRecord = oldTableState != null ? oldTableState.records().get(key) : null;
-                    ts.update(record, oldRecord);
+                    io.succinct.recordmaster.Record oldRecord = null;
+                    if (oldTableState != null) {
+                        RecordPointer oldPtr = oldTableState.recordPointers().get(key);
+                        if (oldPtr != null) {
+                            byte[] bytes = storage.readRecord(oldPtr);
+                            oldRecord = BinaryCodec.deserialize(bytes, oldTableState.entityType());
+                        }
+                    }
+                    byte[] bytes = BinaryCodec.serialize(record);
+                    RecordPointer ptr = storage.appendRecord(bytes);
+                    ts.update(record, oldRecord, ptr);
                 }
             }
 
@@ -220,41 +252,24 @@ public final class RecordTransactionImpl implements RecordTransaction {
     }
 
     @Override
-    public void rollback() {
-        if (status == TransactionStatus.COMMITTED) {
-            throw new InvalidTransactionStateException("Cannot rollback: Transaction is already committed");
-        }
-        if (status == TransactionStatus.ROLLED_BACK) {
-            return;
-        }
-
-        status = TransactionStatus.ROLLING_BACK;
-        try {
-            changeSet.clear();
-            db.getWalManager().appendRollbackMarker(txId, db.currentGeneration(), changeSet.getRollbackReason());
-            status = TransactionStatus.ROLLED_BACK;
-        } catch (Exception e) {
-            throw new TransactionRollbackException(txId, "Failed to rollback transaction", e);
-        } finally {
-            releaseWriterLock();
-        }
+    public boolean isCommitted() {
+        return status == TransactionStatus.COMMITTED;
     }
 
-    private void releaseWriterLock() {
-        if (!lockReleased) {
-            db.releaseWriterLock();
-            lockReleased = true;
-        }
+    @Override
+    public boolean isRolledBack() {
+        return status == TransactionStatus.ROLLED_BACK;
+    }
+
+    @Override
+    public Optional<String> rollbackReason() {
+        return Optional.ofNullable(changeSet.getRollbackReason());
     }
 
     @Override
     public void close() {
-        try {
-            if (status == TransactionStatus.ACTIVE) {
-                rollback();
-            }
-        } finally {
-            releaseWriterLock();
+        if (status == TransactionStatus.ACTIVE) {
+            rollback();
         }
     }
 }

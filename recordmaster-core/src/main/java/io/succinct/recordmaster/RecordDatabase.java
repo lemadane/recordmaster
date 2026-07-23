@@ -28,6 +28,7 @@ public final class RecordDatabase implements AutoCloseable {
 
     private volatile DatabaseState committedState;
     private final Map<String, TableMetadata> tableMetadataMap = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, TableStorage> tableStorageMap = new ConcurrentHashMap<>();
     private volatile Throwable lastPersistenceFailure;
     private volatile boolean closed = false;
     private final long databaseId;
@@ -47,9 +48,34 @@ public final class RecordDatabase implements AutoCloseable {
         this.walManager = new WalManager(directory, durabilityMode);
 
         try {
-            DatabaseState snapState = SnapshotManager.readSnapshot(directory);
+            DatabaseState snapState = SnapshotManager.readSnapshot(directory, (tableName, ts, record, recBytes) -> {
+                TableStorage storage = getTableStorage(tableName);
+                if (ts.recordPointers().isEmpty()) {
+                    storage.close();
+                    Files.deleteIfExists(directory.resolve(tableName + ".db"));
+                    tableStorageMap.remove(tableName);
+                    storage = getTableStorage(tableName);
+                }
+                RecordPointer ptr = storage.appendRecord(recBytes);
+                ts.insert(record, ptr);
+            });
+
+            if (snapState == null) {
+                snapState = new DatabaseState(0);
+            }
+
             List<WalRecord> walRecords = walManager.readAllRecords();
-            this.committedState = RecoveryManager.recover(snapState, walRecords);
+            this.committedState = RecoveryManager.recover(snapState, walRecords, new RecoveryManager.RecoveryStorageHelper() {
+                @Override
+                public io.succinct.recordmaster.Record readRecord(String tableName, Object id, RecordPointer ptr, Class<? extends io.succinct.recordmaster.Record> type) throws Exception {
+                    byte[] bytes = getTableStorage(tableName).readRecord(ptr);
+                    return BinaryCodec.deserialize(bytes, type);
+                }
+                @Override
+                public RecordPointer appendRecord(String tableName, io.succinct.recordmaster.Record record, byte[] bytes) throws Exception {
+                    return getTableStorage(tableName).appendRecord(bytes);
+                }
+            });
 
             for (TableState ts : committedState.tables().values()) {
                 tableMetadataMap.put(ts.tableName(), new TableMetadata(
@@ -76,6 +102,13 @@ public final class RecordDatabase implements AutoCloseable {
 
     public WalManager getWalManager() {
         return walManager;
+    }
+
+    public TableStorage getTableStorage(String tableName) {
+        if (closed) {
+            throw new IllegalStateException("Database is closed");
+        }
+        return tableStorageMap.computeIfAbsent(tableName, name -> new TableStorage(directory, name));
     }
 
     public void releaseWriterLock() {
@@ -128,45 +161,34 @@ public final class RecordDatabase implements AutoCloseable {
                 if (idAccessor == null) {
                     throw new IllegalStateException("Cannot resolve primary key ID component for " + entityType.getName());
                 }
-                idAccessor.setAccessible(true);
                 resolvedIdType = idAccessor.getReturnType();
                 Method finalIdAccessor = idAccessor;
                 resolvedIdExtractor = r -> {
                     try {
                         return finalIdAccessor.invoke(r);
                     } catch (Exception e) {
-                        throw new RuntimeException(e);
+                        throw new RecordMasterException("Failed to access ID", e);
                     }
                 };
             }
 
             List<IndexMetadata> indexMetadataList = new ArrayList<>();
+
             for (RecordComponent comp : entityType.getRecordComponents()) {
-                String fieldName = comp.getName();
-                Method accessor = comp.getAccessor();
-                accessor.setAccessible(true);
-                Function<io.succinct.recordmaster.Record, Object> extractor = r -> {
-                    try {
-                        return accessor.invoke(r);
-                    } catch (Exception e) {
-                        throw new RuntimeException(e);
-                    }
-                };
-
-                List<Index> idxAnnots = new ArrayList<>();
                 if (comp.isAnnotationPresent(Index.class)) {
-                    idxAnnots.add(comp.getAnnotation(Index.class));
-                }
-                if (comp.isAnnotationPresent(Indexes.class)) {
-                    idxAnnots.addAll(Arrays.asList(comp.getAnnotation(Indexes.class).value()));
-                }
-
-                for (Index idx : idxAnnots) {
-                    String idxName = idx.name();
-                    if (idxName.isEmpty()) {
-                        idxName = tableName + "_" + fieldName + "_idx";
-                    }
-                    indexMetadataList.add(new IndexMetadata(idxName, fieldName, idx.unique(), idx.ordered(), extractor));
+                    Index idx = comp.getAnnotation(Index.class);
+                    String idxName = idx.name().isEmpty() ? tableName + "_" + comp.getName() + "_idx" : idx.name();
+                    
+                    Method accessor = comp.getAccessor();
+                    accessor.setAccessible(true);
+                    Function<io.succinct.recordmaster.Record, Object> extractor = r -> {
+                        try {
+                            return accessor.invoke(r);
+                        } catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                    };
+                    indexMetadataList.add(new IndexMetadata(idxName, comp.getName(), idx.unique(), idx.ordered(), extractor));
                 }
             }
 
@@ -205,17 +227,17 @@ public final class RecordDatabase implements AutoCloseable {
 
             RecordTransactionImpl tx = activeTransaction.get();
             if (tx != null) {
-                tx.getCommittedDbState().tables().put(tableName, newTableState.copy());
+                tx.getCommittedDbState().tables().put(tableName, newTableState);
             }
 
         } catch (Exception e) {
-            throw new RecordMasterException("Failed to register table metadata for " + tableName, e);
+            throw new RecordMasterException("Failed to register table: " + tableName, e);
         } finally {
             writeLock.unlock();
         }
     }
 
-    private String getTableName(Class<?> entityType) {
+    public String getTableName(Class<?> entityType) {
         if (entityType.isAnnotationPresent(Table.class)) {
             String val = entityType.getAnnotation(Table.class).value();
             if (!val.isEmpty()) return val;
@@ -258,14 +280,36 @@ public final class RecordDatabase implements AutoCloseable {
     }
 
     public <R> R transaction(TransactionFunction<R> txFunc) {
+        RecordTransactionImpl current = activeTransaction.get();
+        if (current != null) {
+            try {
+                return txFunc.execute(current);
+            } catch (Exception e) {
+                if (e instanceof RuntimeException re) throw re;
+                throw new RecordMasterException("Transaction execution failed", e);
+            }
+        }
+
         CompletableFuture<R> future = new CompletableFuture<>();
         Thread.ofVirtual().start(() -> {
-            try (RecordTransaction tx = beginTransaction()) {
-                R result = txFunc.execute(tx);
-                if (tx.isActive()) {
-                    tx.commit();
+            try {
+                RecordTransaction tx = beginTransaction();
+                try {
+                    R result = txFunc.execute(tx);
+                    if (tx.isActive()) {
+                        tx.commit();
+                    }
+                    future.complete(result);
+                } catch (Throwable t) {
+                    try {
+                        if (tx.isActive()) {
+                            tx.rollback();
+                        }
+                    } catch (Throwable rollbackErr) {
+                        t.addSuppressed(rollbackErr);
+                    }
+                    future.completeExceptionally(t);
                 }
-                future.complete(result);
             } catch (Throwable t) {
                 future.completeExceptionally(t);
             }
@@ -288,35 +332,11 @@ public final class RecordDatabase implements AutoCloseable {
         }
     }
 
-    public void transaction(TransactionConsumer txCons) {
-        CompletableFuture<Void> future = new CompletableFuture<>();
-        Thread.ofVirtual().start(() -> {
-            try (RecordTransaction tx = beginTransaction()) {
-                txCons.execute(tx);
-                if (tx.isActive()) {
-                    tx.commit();
-                }
-                future.complete(null);
-            } catch (Throwable t) {
-                future.completeExceptionally(t);
-            }
+    public void transaction(TransactionConsumer txConsumer) {
+        transaction(tx -> {
+            txConsumer.execute(tx);
+            return null;
         });
-
-        try {
-            future.get();
-        } catch (ExecutionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof RuntimeException re) {
-                throw re;
-            }
-            if (cause instanceof Error err) {
-                throw err;
-            }
-            throw new RecordMasterException("Transaction callback exception occurred", cause);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RecordMasterException("Transaction interrupted", e);
-        }
     }
 
     public Set<String> tableNames() {
@@ -357,6 +377,14 @@ public final class RecordDatabase implements AutoCloseable {
             nextState.tables().remove(tableName);
             publish(nextState);
             tableMetadataMap.remove(tableName);
+            
+            // Delete table storage
+            TableStorage storage = tableStorageMap.remove(tableName);
+            if (storage != null) {
+                storage.close();
+            }
+            Files.deleteIfExists(directory.resolve(tableName + ".db"));
+
             return true;
         } catch (Exception e) {
             throw new RecordMasterException("Failed to drop table " + tableName, e);
@@ -385,7 +413,15 @@ public final class RecordDatabase implements AutoCloseable {
     public void compact() {
         writeLock.lock();
         try {
-            SnapshotManager.writeSnapshot(directory, committedState);
+            SnapshotManager.writeSnapshot(directory, committedState, (tableName, key, ptr) -> getTableStorage(tableName).readRecord(ptr));
+            
+            // Compact storage files on disk
+            for (Map.Entry<String, TableState> entry : committedState.tables().entrySet()) {
+                String tableName = entry.getKey();
+                TableState ts = entry.getValue();
+                getTableStorage(tableName).compact(ts.recordPointers());
+            }
+
             walManager.truncate();
         } catch (Exception e) {
             this.lastPersistenceFailure = e;
@@ -402,7 +438,10 @@ public final class RecordDatabase implements AutoCloseable {
 
             for (TableState ts : stable.tables().values()) {
                 List<Map<String, Object>> recs = new ArrayList<>();
-                for (io.succinct.recordmaster.Record rec : ts.records().values()) {
+                TableStorage storage = getTableStorage(ts.tableName());
+                for (RecordPointer ptr : ts.recordPointers().values()) {
+                    byte[] bytes = storage.readRecord(ptr);
+                    io.succinct.recordmaster.Record rec = BinaryCodec.deserialize(bytes, ts.entityType());
                     Map<String, Object> map = new LinkedHashMap<>();
                     for (RecordComponent comp : rec.getClass().getRecordComponents()) {
                         Object val = comp.getAccessor().invoke(rec);
@@ -534,6 +573,12 @@ public final class RecordDatabase implements AutoCloseable {
     public void close() {
         if (closed) return;
         closed = true;
+        
+        for (TableStorage ts : tableStorageMap.values()) {
+            ts.close();
+        }
+        tableStorageMap.clear();
+        
         executor.close();
         walManager.close();
     }

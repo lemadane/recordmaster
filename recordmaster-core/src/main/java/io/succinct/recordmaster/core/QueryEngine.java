@@ -10,16 +10,18 @@ public final class QueryEngine<T extends io.succinct.recordmaster.Record> implem
     private final TableState committedTable;
     private final TableChangeSet staging;
     private final IndexChangeSet indexStaging;
+    private final RecordDatabase db;
     private final List<Condition> conditions = new ArrayList<>();
     private SortOrder sortOrder;
     private int limit = -1;
     private int offset = 0;
 
-    public QueryEngine(String tableName, TableState committedTable, TableChangeSet staging, IndexChangeSet indexStaging) {
+    public QueryEngine(String tableName, TableState committedTable, TableChangeSet staging, IndexChangeSet indexStaging, RecordDatabase db) {
         this.tableName = tableName;
         this.committedTable = committedTable;
         this.staging = staging;
         this.indexStaging = indexStaging;
+        this.db = db;
     }
 
     @Override
@@ -56,7 +58,7 @@ public final class QueryEngine<T extends io.succinct.recordmaster.Record> implem
             stream = staging.getInserts().values().stream();
         } else {
             Stream<io.succinct.recordmaster.Record> committedStream = committedTable != null ? 
-                    committedTable.records().entrySet().stream()
+                    committedTable.recordPointers().entrySet().stream()
                             .filter(e -> {
                                 Object key = e.getKey();
                                 if (staging != null) {
@@ -66,7 +68,14 @@ public final class QueryEngine<T extends io.succinct.recordmaster.Record> implem
                                 }
                                 return true;
                             })
-                            .map(Map.Entry::getValue) : Stream.empty();
+                            .map(e -> {
+                                try {
+                                    byte[] bytes = db.getTableStorage(tableName).readRecord(e.getValue());
+                                    return BinaryCodec.deserialize(bytes, committedTable.entityType());
+                                } catch (Exception ex) {
+                                    throw new RecordMasterException("Failed to read record from disk in query", ex);
+                                }
+                            }) : Stream.empty();
 
             Stream<io.succinct.recordmaster.Record> stagedStream = staging != null ? 
                     Stream.concat(staging.getInserts().values().stream(), staging.getUpdates().values().stream()) :

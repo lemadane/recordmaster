@@ -2,12 +2,9 @@ package io.succinct.recordmaster.core;
 
 import io.succinct.recordmaster.Record;
 import java.io.*;
-import java.nio.ByteBuffer;
-import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.function.Function;
 import java.util.zip.CRC32C;
@@ -16,7 +13,15 @@ public final class SnapshotManager {
 
     private static final int MAGIC = 0x524d534e; // RMSN
 
-    public static void writeSnapshot(Path directory, DatabaseState dbState) throws Exception {
+    public interface RecordBytesWriter {
+        byte[] getRecordBytes(String tableName, Object key, RecordPointer ptr) throws Exception;
+    }
+
+    public interface RecordBytesLoader {
+        void loadRecord(String tableName, TableState ts, Record record, byte[] recBytes) throws Exception;
+    }
+
+    public static void writeSnapshot(Path directory, DatabaseState dbState, RecordBytesWriter writer) throws Exception {
         long gen = dbState.generation();
         Path tmpPath = directory.resolve("snapshot." + gen + ".tmp");
         Path finalPath = directory.resolve("snapshot." + gen);
@@ -46,10 +51,10 @@ public final class SnapshotManager {
                 }
 
                 // Write Records
-                Map<Object, Record> records = ts.records();
-                dos.writeInt(records.size());
-                for (Record rec : records.values()) {
-                    byte[] recBytes = BinaryCodec.serialize(rec);
+                Map<Object, RecordPointer> pointers = ts.recordPointers();
+                dos.writeInt(pointers.size());
+                for (Map.Entry<Object, RecordPointer> entry : pointers.entrySet()) {
+                    byte[] recBytes = writer.getRecordBytes(ts.tableName(), entry.getKey(), entry.getValue());
                     dos.writeInt(recBytes.length);
                     dos.write(recBytes);
                 }
@@ -82,7 +87,7 @@ public final class SnapshotManager {
     }
 
     @SuppressWarnings("unchecked")
-    public static DatabaseState readSnapshot(Path directory) throws Exception {
+    public static DatabaseState readSnapshot(Path directory, RecordBytesLoader loader) throws Exception {
         Path snapshotPath = findLatestSnapshot(directory);
         if (snapshotPath == null) {
             return null;
@@ -168,17 +173,12 @@ public final class SnapshotManager {
 
                 TableState ts = new TableState(tableName, idType, entityType, idExtractor, indexMetadataList);
 
-                // Read records
+                // Read records (read here to update checksum validation, we load them in the second pass)
                 int recordCount = dis.readInt();
                 for (int r = 0; r < recordCount; r++) {
                     int len = dis.readInt();
-                    byte[] recBytes = new byte[len];
-                    int read = dis.readNBytes(recBytes, 0, len);
-                    if (read < len) {
-                        throw new IOException("EOF reached while reading record bytes");
-                    }
-                    Record record = BinaryCodec.deserialize(recBytes, entityType);
-                    ts.insert(record);
+                    byte[] temp = new byte[len];
+                    dis.readFully(temp);
                 }
 
                 dbState.tables().put(tableName, ts);
@@ -193,7 +193,7 @@ public final class SnapshotManager {
             throw new IOException("Corrupt snapshot: Checksum failure");
         }
 
-        return readSnapshotDatabaseState(snapshotPath);
+        return readSnapshotDatabaseState(snapshotPath, loader);
     }
 
     private static Path findLatestSnapshot(Path directory) throws IOException {
@@ -208,13 +208,12 @@ public final class SnapshotManager {
                              } catch (NumberFormatException e) {
                                  return -1;
                              }
-                         })).orElse(null);
+                          })).orElse(null);
         }
     }
 
     @SuppressWarnings("unchecked")
-    private static DatabaseState readSnapshotDatabaseState(Path snapshotPath) throws Exception {
-        // Safe rerun read without CheckedInputStream wrapper logic just to produce clean result
+    private static DatabaseState readSnapshotDatabaseState(Path snapshotPath, RecordBytesLoader loader) throws Exception {
         try (FileInputStream fis = new FileInputStream(snapshotPath.toFile());
              BufferedInputStream bis = new BufferedInputStream(fis);
              DataInputStream dis = new DataInputStream(bis)) {
@@ -282,7 +281,7 @@ public final class SnapshotManager {
                     byte[] recBytes = new byte[len];
                     dis.readFully(recBytes);
                     Record record = BinaryCodec.deserialize(recBytes, entityType);
-                    ts.insert(record);
+                    loader.loadRecord(tableName, ts, record, recBytes);
                 }
 
                 dbState.tables().put(tableName, ts);
@@ -291,6 +290,7 @@ public final class SnapshotManager {
         }
     }
 }
+
 class CheckedInputStream extends FilterInputStream {
     private final CRC32C crc;
     public CheckedInputStream(InputStream in, CRC32C crc) {
@@ -317,6 +317,7 @@ class CheckedInputStream extends FilterInputStream {
         return crc;
     }
 }
+
 class CheckedOutputStream extends FilterOutputStream {
     private final CRC32C crc;
     public CheckedOutputStream(OutputStream out, CRC32C crc) {

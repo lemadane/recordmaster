@@ -67,4 +67,13 @@ public final class IndexState {
     public Map<Object, Set<Object>> getSecondaryMap() {
         return secondaryMap;
     }
+
+    public void clear() {
+        if (uniqueMap != null) {
+            uniqueMap.clear();
+        }
+        if (secondaryMap != null) {
+            secondaryMap.clear();
+        }
+    }
 }

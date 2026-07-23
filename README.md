@@ -95,6 +95,41 @@ db.transaction(tx -> {
 
 ---
 
+## 🧠 Handling Relational Joins & Analytics
+
+Since RecordMaster is a transactional key-value/object store rather than a full SQL relational engine, it does not include a native SQL query optimizer. We address complex queries, joins, and analytics through three features:
+
+### 1. Programmatic Joins (Type-Safe Metamodel)
+Because RecordMaster maps data directly to Java records, you perform table joins using clean Java APIs and generated metamodels, powered by Java 21 virtual threads:
+
+```java
+// Query customer and join their orders programmatically
+db.transaction(tx -> {
+    Customer customer = tx.table(Customer.class).findById(customerId).orElseThrow();
+    
+    // Type-safe lookup using generated OrderFields metadata
+    List<Order> orders = tx.table(Order.class).query()
+        .where(OrderFields.customerId.eq(customerId))
+        .list();
+        
+    return new CustomerWithOrders(customer, orders);
+});
+```
+
+### 2. Index-Based Query Routing
+When you query fields annotated with `@Index` (e.g., `where(CustomerFields.email.eq(email))`), the `QueryEngine` automatically routes the lookup through the fast, in-memory `IndexState` maps. It obtains the record ID and pointer instantly, bypassing full-table disk scans and only reading the matching record's bytes from disk.
+
+### 3. The SQL Migration Escape Hatch
+If your analytical queries grow too complex or require heavy SQL aggregation/join operations, you can easily migrate your entire RecordMaster database to a relational SQL target (PostgreSQL, MySQL, or SQLite) in one step:
+
+```java
+// Migrate RecordMaster database schema and records to a PostgreSQL target
+Connection conn = DriverManager.getConnection("jdbc:postgresql://localhost:5432/mydb", "user", "pass");
+SqlMigrator.migrate(db, conn, SqlDialect.POSTGRESQL);
+```
+
+---
+
 ## 🛠️ Build and Verification
 
 To build and run all automated tests (unit and integration tests) using Java 21:
