@@ -930,6 +930,41 @@ The demo includes endpoints for atomic multi-table writes and rollback behavior.
 
 ---
 
+# Performance and Stress Test Results
+
+RecordMaster includes a built-in performance and stress test suite under the `stressTest` Gradle task. The benchmark runs four different scenarios with 1 million records in total per scenario, using `DurabilityMode.ASYNC` database durability.
+
+The scenarios test both synchronous (sequential on a single thread) and asynchronous (concurrent using Java 21 virtual threads) write and query operations.
+
+## Benchmark Results (1,000,000 Records)
+
+| Test Scenario | Total Records | Write Performance | Primary Key Lookup / Verification | Memory (RAM) Delta | Disk Footprint |
+|---|---|---|---|---|---|
+| **Single-Table Sync** | 1,000,000 | 49.86s (20,057/s) | 0.14s (35,971/s) | 150.18 MB | 255.37 MB |
+| **Single-Table Async** | 1,000,000 | 53.21s (18,793/s) | 0.03s (172,414/s) | 149.85 MB | 257.28 MB |
+| **Multi-Table Sync** | 999,999 | 48.42s (20,652/s) | 0.17s (35,928/s) | 140.98 MB | 228.88 MB |
+| **Multi-Table Async** | 999,999 | 47.38s (21,108/s) | 0.02s (300,000/s) | 140.77 MB | 229.52 MB |
+
+*Note: Asynchronous query tests run queries across 10 virtual threads concurrently. Memory delta indicates heap usage after garbage collection. Disk size includes table data and the write-ahead log (WAL) generated during the run.*
+
+### How to Run the Benchmarks
+
+You can execute the performance and stress tests yourself by pointing `JAVA_HOME` to a compatible JDK 21+ and running:
+
+```bash
+JAVA_HOME=/path/to/jdk-21 ./gradlew :recordmaster-core:stressTest --args="--records 1000000 --batch 100000"
+```
+
+The task accepts several command-line flags via `--args`:
+- `--records <count>`: The total number of records to write/query.
+- `--batch <size>`: The transaction batch size for writes.
+- `--durability <SYNC|BATCHED|ASYNC>`: The database durability mode to use.
+- `--mode <sync|async|both>`: Whether to run single-threaded (sync) or concurrent virtual-threaded (async) tests.
+- `--tables <single|multi|both>`: Run tests against a single table or multiple tables.
+- `--path <dir>`: The directory to store test databases.
+
+---
+
 # Development Status and Roadmap
 
 RecordMaster is an actively developed embedded database project. Important next steps include:
@@ -940,8 +975,9 @@ RecordMaster is an actively developed embedded database project. Important next 
 - Add generated paths for nested record components.
 - Expand binary-codec type support.
 - Add a lock-coordinated online backup API.
-- Publish reproducible benchmarks and stress-test results.
+- [x] Publish reproducible benchmarks and stress-test results.
 - Expand crash, corruption, concurrency, and long-running soak tests.
+
 
 Production users should pin a release or commit, test crash recovery, select the durability mode deliberately, maintain verified backups, and benchmark the expected workload.
 
