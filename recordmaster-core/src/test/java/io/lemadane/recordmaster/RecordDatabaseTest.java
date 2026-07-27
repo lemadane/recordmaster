@@ -403,4 +403,43 @@ public class RecordDatabaseTest {
         assertEquals(person, recovered.get());
         assertEquals("123 Main St", recovered.get().address().street());
     }
+
+    @Test
+    public void testBackupAndRestore() throws Exception {
+        UUID id = UUID.randomUUID();
+        Customer customer = new Customer(id, "backup@example.com", "Backup Customer", CustomerStatus.ACTIVE, Instant.now());
+        db.transaction((TransactionConsumer) tx -> tx.table(Customer.class).insert(customer));
+
+        Path backupDir = tempDir.resolve("backup-destination");
+        db.backup(backupDir);
+
+        // Open the backup database as a separate instance
+        try (RecordDatabase backupDb = RecordDatabase.open(backupDir)) {
+            Optional<Customer> found = backupDb.table(Customer.class).findById(id);
+            assertTrue(found.isPresent());
+            assertEquals("Backup Customer", found.get().name());
+            assertEquals("backup@example.com", found.get().email());
+        }
+    }
+
+    @Test
+    public void testBackupRestoresConsistentPointInTime() throws Exception {
+        UUID id1 = UUID.randomUUID();
+        Customer c1 = new Customer(id1, "first@example.com", "First Customer", CustomerStatus.ACTIVE, Instant.now());
+        db.transaction((TransactionConsumer) tx -> tx.table(Customer.class).insert(c1));
+
+        Path backupDir = tempDir.resolve("backup-pitr-destination");
+        db.backup(backupDir);
+
+        // Insert another customer after the backup
+        UUID id2 = UUID.randomUUID();
+        Customer c2 = new Customer(id2, "second@example.com", "Second Customer", CustomerStatus.ACTIVE, Instant.now());
+        db.transaction((TransactionConsumer) tx -> tx.table(Customer.class).insert(c2));
+
+        // Open the backup database and verify it ONLY has the first customer
+        try (RecordDatabase backupDb = RecordDatabase.open(backupDir)) {
+            assertTrue(backupDb.table(Customer.class).findById(id1).isPresent());
+            assertFalse(backupDb.table(Customer.class).findById(id2).isPresent());
+        }
+    }
 }

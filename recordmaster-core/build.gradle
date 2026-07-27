@@ -17,3 +17,15 @@ dependencies {
 test {
     useJUnitPlatform()
 }
+
+tasks.register('stressTest', JavaExec) {
+    group = 'Verification'
+    description = 'Runs the RecordMaster performance and stress benchmarks'
+    classpath = sourceSets.main.runtimeClasspath + sourceSets.test.runtimeClasspath
+    mainClass = 'io.lemadane.recordmaster.StressTestLauncher'
+    
+    // Pass any arguments passed to gradlew --args="..."
+    if (project.hasProperty('args')) {
+        args project.args.split('\\s+')
+    }
+}

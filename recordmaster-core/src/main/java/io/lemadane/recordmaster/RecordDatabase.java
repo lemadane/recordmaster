@@ -237,6 +237,42 @@ public final class RecordDatabase implements AutoCloseable {
         }
     }
 
+    public void backup(Path targetDir) {
+        writeLock.lock();
+        try {
+            if (closed) {
+                throw new IllegalStateException("Database is closed");
+            }
+            if (!Files.exists(targetDir)) {
+                Files.createDirectories(targetDir);
+            }
+
+            // 1. Copy snapshot if exists
+            Path sourceSnapshot = directory.resolve("snapshot.bin");
+            if (Files.exists(sourceSnapshot)) {
+                Files.copy(sourceSnapshot, targetDir.resolve("snapshot.bin"), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+
+            // 2. Copy WAL log if exists
+            Path sourceWal = directory.resolve("wal.log");
+            if (Files.exists(sourceWal)) {
+                Files.copy(sourceWal, targetDir.resolve("wal.log"), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            }
+
+            // 3. Copy table database files
+            for (String tableName : committedState.tables().keySet()) {
+                Path sourceTable = directory.resolve(tableName + ".db");
+                if (Files.exists(sourceTable)) {
+                    Files.copy(sourceTable, targetDir.resolve(tableName + ".db"), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+        } catch (IOException e) {
+            throw new RecordMasterException("Failed to perform hot backup to " + targetDir, e);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
     public String getTableName(Class<?> entityType) {
         if (entityType.isAnnotationPresent(Table.class)) {
             String val = entityType.getAnnotation(Table.class).value();
