@@ -30,6 +30,7 @@ public final class WalManager implements AutoCloseable {
     private final ConcurrentSkipListMap<Long, CompletableFuture<Void>> pendingFlushes = new ConcurrentSkipListMap<>();
     private final ReentrantLock flushLock = new ReentrantLock();
     private final Condition flushCondition = flushLock.newCondition();
+    private volatile long lastAppendedGeneration = 0;
     private volatile long lastForcedGeneration = 0;
 
     public WalManager(Path directory, DurabilityMode durabilityMode) {
@@ -59,7 +60,8 @@ public final class WalManager implements AutoCloseable {
     }
 
     public void setLastForcedGeneration(long generation) {
-        this.lastForcedGeneration = generation;
+        this.lastAppendedGeneration = Math.max(this.lastAppendedGeneration, generation);
+        this.lastForcedGeneration = Math.max(this.lastForcedGeneration, generation);
     }
 
     public void appendTransaction(long transactionId, long generation, List<WalRecord> records) {
@@ -91,6 +93,8 @@ public final class WalManager implements AutoCloseable {
             while (buf.hasRemaining()) {
                 fileChannel.write(buf);
             }
+
+            lastAppendedGeneration = Math.max(lastAppendedGeneration, generation);
 
             if (durabilityMode == DurabilityMode.SYNC) {
                 fileChannel.force(false);
@@ -134,7 +138,9 @@ public final class WalManager implements AutoCloseable {
             while (buf.hasRemaining()) {
                 fileChannel.write(buf);
             }
+            lastAppendedGeneration = Math.max(lastAppendedGeneration, records.get(records.size()-1).generation());
             fileChannel.force(false);
+            lastForcedGeneration = Math.max(lastForcedGeneration, lastAppendedGeneration);
         } finally {
             writeLock.unlock();
         }
@@ -153,6 +159,7 @@ public final class WalManager implements AutoCloseable {
             while (buf.hasRemaining()) {
                 fileChannel.write(buf);
             }
+            lastAppendedGeneration = Math.max(lastAppendedGeneration, generation);
             if (durabilityMode == DurabilityMode.SYNC) {
                 fileChannel.force(false);
                 lastForcedGeneration = Math.max(lastForcedGeneration, generation);
@@ -196,7 +203,11 @@ public final class WalManager implements AutoCloseable {
     public List<WalRecord> readAllRecords() throws IOException {
         writeLock.lock();
         try {
+            if (!Files.exists(walPath) || Files.size(walPath) == 0) {
+                return Collections.emptyList();
+            }
             fileChannel.position(0);
+
             List<WalRecord> records = new ArrayList<>();
             ByteBuffer headerBuf = ByteBuffer.allocate(29); // 4 + 1 + 8 + 8 + 4 + 4
 
@@ -266,10 +277,6 @@ public final class WalManager implements AutoCloseable {
                 crc.update(payload);
 
                 if ((int) crc.getValue() != checksum) {
-                    if (fileChannel.position() == fileChannel.size()) {
-                        fileChannel.truncate(recordStartPos);
-                        break;
-                    }
                     throw new CorruptWalException("Corrupt WAL: Checksum mismatch in log file");
                 }
 
@@ -299,6 +306,7 @@ public final class WalManager implements AutoCloseable {
             fileChannel.truncate(0);
             fileChannel.position(0);
             fileChannel.force(true);
+            lastAppendedGeneration = 0;
             lastForcedGeneration = 0;
         } finally {
             writeLock.unlock();
@@ -310,36 +318,27 @@ public final class WalManager implements AutoCloseable {
             while (!closed) {
                 flushLock.lock();
                 try {
-                    // Wait for pending flushes or timeout (10ms batch window)
-                    if (pendingFlushes.isEmpty()) {
-                        flushCondition.await(10, TimeUnit.MILLISECONDS);
-                    }
+                    flushCondition.await(10, TimeUnit.MILLISECONDS);
+                    flushPending();
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
                 } finally {
                     flushLock.unlock();
                 }
-                flushPending();
             }
+            flushPending();
         });
     }
 
     private void flushPending() {
-        if (pendingFlushes.isEmpty()) return;
-
         writeLock.lock();
         try {
-            if (closed) return;
-            fileChannel.force(false);
-            
-            long maxFlushedGen = lastForcedGeneration;
-            Map.Entry<Long, CompletableFuture<Void>> lastEntry = pendingFlushes.lastEntry();
-            if (lastEntry != null) {
-                maxFlushedGen = lastEntry.getKey();
+            if (fileChannel != null && fileChannel.isOpen()) {
+                fileChannel.force(false);
             }
-
-            lastForcedGeneration = maxFlushedGen;
+            long maxFlushedGen = pendingFlushes.isEmpty() ? lastAppendedGeneration : pendingFlushes.lastKey();
+            lastForcedGeneration = Math.max(lastForcedGeneration, maxFlushedGen);
 
             // Complete all futures <= maxFlushedGen
             while (!pendingFlushes.isEmpty()) {
@@ -371,7 +370,7 @@ public final class WalManager implements AutoCloseable {
         try {
             if (closed) return;
             fileChannel.force(false);
-            lastForcedGeneration = Long.MAX_VALUE;
+            lastForcedGeneration = Math.max(lastForcedGeneration, lastAppendedGeneration);
             // Complete all pending futures
             while (!pendingFlushes.isEmpty()) {
                 Map.Entry<Long, CompletableFuture<Void>> entry = pendingFlushes.pollFirstEntry();
@@ -396,7 +395,7 @@ public final class WalManager implements AutoCloseable {
             try {
                 if (fileChannel != null && fileChannel.isOpen()) {
                     fileChannel.force(false);
-                    lastForcedGeneration = Long.MAX_VALUE;
+                    lastForcedGeneration = Math.max(lastForcedGeneration, lastAppendedGeneration);
                 }
             } catch (IOException e) {
                 // ignore

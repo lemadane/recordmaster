@@ -22,6 +22,14 @@ public class SchemaWalRecoveryTest {
         @Index(name = "idx_user_age", ordered = true) Integer age
     ) implements Record {}
 
+    @Table("multi_index_user")
+    public record MultiIndexUser(
+        @Id Long id,
+        @Index(name = "by_email")
+        @Index(name = "email_unique", unique = true)
+        String email
+    ) implements Record {}
+
     @Test
     public void testCustomIndexNameRecovery(@TempDir Path dbDir) {
         try (RecordDatabase db = RecordDatabase.open(dbDir)) {
@@ -39,6 +47,20 @@ public class SchemaWalRecoveryTest {
             assertNotNull(user);
             assertEquals("alice@example.com", user.email());
             assertEquals(30, user.age());
+        }
+    }
+
+    @Test
+    public void testRepeatableIndexAnnotations(@TempDir Path dbDir) {
+        try (RecordDatabase db = RecordDatabase.open(dbDir)) {
+            RecordTable<Long, MultiIndexUser> table = db.table(MultiIndexUser.class);
+            table.insert(new MultiIndexUser(1L, "multi@example.com"));
+
+            assertThrows(DuplicateIndexValueException.class, () -> {
+                db.transaction(tx -> {
+                    tx.table(MultiIndexUser.class).insert(new MultiIndexUser(2L, "multi@example.com"));
+                });
+            });
         }
     }
 

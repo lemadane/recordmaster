@@ -46,6 +46,9 @@ public final class RecoveryManager {
         long currentGen = dbState.generation();
 
         for (TxKey txKey : sortedTxKeys) {
+            if (initialState != null && txKey.generation() <= initialState.generation()) {
+                continue;
+            }
             List<WalRecord> recs = txGroups.get(txKey);
             for (WalRecord rec : recs) {
                 currentGen = Math.max(currentGen, rec.generation());

@@ -1,6 +1,6 @@
 allprojects {
     group = 'io.lemadane.recordmaster'
-    version = '1.0.0'
+    version = '1.0.0-rc1'
 
     repositories {
         mavenCentral()
@@ -18,7 +18,13 @@ subprojects {
                     }
                 }
             }
+            if (project.hasProperty('testJavaVersion')) {
+                tasks.withType(Test).configureEach {
+                    javaLauncher = javaToolchains.launcherFor {
+                        languageVersion = JavaLanguageVersion.of(project.property('testJavaVersion').toString())
+                    }
+                }
+            }
         }
     }
 }
-

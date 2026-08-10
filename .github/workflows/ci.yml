@@ -31,16 +31,16 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Build & Run Full Test Suite
-        run: ./gradlew build test --stacktrace
+        run: ./gradlew build test -PtestJavaVersion=${{ matrix.java-version }} --stacktrace
 
       - name: Run High-Concurrency & Deadlock Tests
-        run: ./gradlew :recordmaster-core:test --tests "io.lemadane.recordmaster.DeadlockStressTest" --tests "io.lemadane.recordmaster.ConcurrentCompactionTest"
+        run: ./gradlew :recordmaster-core:test -PtestJavaVersion=${{ matrix.java-version }} --tests "io.lemadane.recordmaster.DeadlockStressTest" --tests "io.lemadane.recordmaster.ConcurrentCompactionTest" --tests "io.lemadane.recordmaster.ConcurrentDropTableTest"
 
-      - name: Run SIGKILL Crash-Injection Harness
-        run: ./gradlew :recordmaster-core:test --tests "io.lemadane.recordmaster.CrashInjectionTest"
+      - name: Run SIGKILL Crash-Injection & Chaos Harness
+        run: ./gradlew :recordmaster-core:test -PtestJavaVersion=${{ matrix.java-version }} --tests "io.lemadane.recordmaster.CrashInjectionTest" --tests "io.lemadane.recordmaster.ChaosE2ETest"
 
       - name: Run Corruption & WAL Bounds Tests
-        run: ./gradlew :recordmaster-core:test --tests "io.lemadane.recordmaster.WalCorruptionTest"
+        run: ./gradlew :recordmaster-core:test -PtestJavaVersion=${{ matrix.java-version }} --tests "io.lemadane.recordmaster.WalCorruptionTest"
 
       - name: Run Stress & Soak Benchmark Suite
-        run: ./gradlew :recordmaster-core:stressTest --args="--records=50000 --threads=8"
+        run: ./gradlew :recordmaster-core:stressTest -PtestJavaVersion=${{ matrix.java-version }} --args="--records 50000 --batch 5000 --mode both --tables both"

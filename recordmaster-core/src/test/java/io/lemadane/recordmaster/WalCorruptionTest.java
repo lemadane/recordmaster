@@ -1,12 +1,18 @@
 package io.lemadane.recordmaster;
 
 import io.lemadane.recordmaster.core.CorruptWalException;
+import io.lemadane.recordmaster.core.RecordWalOperation;
+import io.lemadane.recordmaster.core.WalManager;
+import io.lemadane.recordmaster.core.WalRecord;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import java.io.DataOutputStream;
 import java.io.FileOutputStream;
+import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 public class WalCorruptionTest {
@@ -54,6 +60,34 @@ public class WalCorruptionTest {
 
             dos.writeInt(12345);
             dos.flush();
+        }
+
+        assertThrows(CorruptWalException.class, () -> {
+            RecordDatabase.open(dbDir);
+        });
+    }
+
+    @Test
+    public void testCorruptedFinalCommitMustFailRecovery(@TempDir Path dbDir) throws Exception {
+        Files.createDirectories(dbDir);
+        Path walFile = dbDir.resolve("wal.log");
+
+        try (WalManager wal = new WalManager(dbDir, DurabilityMode.SYNC)) {
+            wal.appendTransaction(100L, 1L, List.of(
+                new WalRecord(RecordWalOperation.CREATE_TABLE, 100L, 1L, "test".getBytes())
+            ));
+        }
+
+        assertTrue(Files.exists(walFile));
+        long len = Files.size(walFile);
+        assertTrue(len > 0);
+
+        // Corrupt 1 byte in the final commit record checksum without altering file length
+        try (RandomAccessFile raf = new RandomAccessFile(walFile.toFile(), "rw")) {
+            raf.seek(len - 2);
+            byte b = raf.readByte();
+            raf.seek(len - 2);
+            raf.writeByte(b ^ 0xFF); // Flip bits
         }
 
         assertThrows(CorruptWalException.class, () -> {

@@ -27,18 +27,28 @@ public class StressTestLauncher {
         String dbPath = "data/stress-db";
 
         for (int i = 0; i < args.length; i++) {
-            if (args[i].equals("--records") && i + 1 < args.length) {
-                totalRecords = Integer.parseInt(args[++i]);
-            } else if (args[i].equals("--batch") && i + 1 < args.length) {
-                batchSize = Integer.parseInt(args[++i]);
-            } else if (args[i].equals("--durability") && i + 1 < args.length) {
-                durabilityMode = DurabilityMode.valueOf(args[++i].toUpperCase());
-            } else if (args[i].equals("--mode") && i + 1 < args.length) {
-                modeOpt = args[++i].toLowerCase();
-            } else if (args[i].equals("--tables") && i + 1 < args.length) {
-                tablesOpt = args[++i].toLowerCase();
-            } else if (args[i].equals("--path") && i + 1 < args.length) {
-                dbPath = args[++i];
+            String arg = args[i];
+            String key = arg;
+            String val = null;
+
+            if (arg.contains("=")) {
+                String[] parts = arg.split("=", 2);
+                key = parts[0];
+                val = parts[1];
+            } else if (i + 1 < args.length && !args[i + 1].startsWith("--")) {
+                val = args[++i];
+            }
+
+            if (val != null) {
+                switch (key) {
+                    case "--records" -> totalRecords = Integer.parseInt(val);
+                    case "--batch" -> batchSize = Integer.parseInt(val);
+                    case "--durability" -> durabilityMode = DurabilityMode.valueOf(val.toUpperCase());
+                    case "--mode" -> modeOpt = val.toLowerCase();
+                    case "--tables" -> tablesOpt = val.toLowerCase();
+                    case "--path" -> dbPath = val;
+                    case "--threads" -> {} // ignore gracefully
+                }
             }
         }
 

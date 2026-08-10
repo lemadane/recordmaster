@@ -222,8 +222,8 @@ public final class RecordDatabase implements AutoCloseable {
             List<IndexMetadata> indexMetadataList = new ArrayList<>();
 
             for (RecordComponent comp : entityType.getRecordComponents()) {
-                if (comp.isAnnotationPresent(Index.class)) {
-                    Index idx = comp.getAnnotation(Index.class);
+                Index[] indexes = comp.getAnnotationsByType(Index.class);
+                for (Index idx : indexes) {
                     String idxName = idx.name().isEmpty() ? tableName + "_" + comp.getName() + "_idx" : idx.name();
                     
                     Method accessor = comp.getAccessor();
@@ -713,25 +713,30 @@ public final class RecordDatabase implements AutoCloseable {
         writeLock.lock();
         try {
             if (closed) return;
-            closed = true;
-            
-            for (TableStorage ts : tableStorageMap.values()) {
-                ts.close();
-            }
-            tableStorageMap.clear();
-            
-            executor.close();
-            walManager.close();
-
+            compactionLock.writeLock().lock();
             try {
-                if (lockFile != null && lockFile.isValid()) {
-                    lockFile.release();
+                closed = true;
+                
+                for (TableStorage ts : tableStorageMap.values()) {
+                    ts.close();
                 }
-                if (lockChannel != null && lockChannel.isOpen()) {
-                    lockChannel.close();
+                tableStorageMap.clear();
+                
+                executor.close();
+                walManager.close();
+
+                try {
+                    if (lockFile != null && lockFile.isValid()) {
+                        lockFile.release();
+                    }
+                    if (lockChannel != null && lockChannel.isOpen()) {
+                        lockChannel.close();
+                    }
+                } catch (Exception e) {
+                    // ignore
                 }
-            } catch (Exception e) {
-                // ignore
+            } finally {
+                compactionLock.writeLock().unlock();
             }
         } finally {
             writeLock.unlock();

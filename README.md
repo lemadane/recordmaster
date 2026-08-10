@@ -67,8 +67,8 @@ Add the core library and annotation processor:
 
 ```groovy
 dependencies {
-    implementation 'com.github.lemadane.recordmaster:recordmaster-core:v1.0.0'
-    annotationProcessor 'com.github.lemadane.recordmaster:recordmaster-processor:v1.0.0'
+    implementation 'com.github.lemadane.recordmaster:recordmaster-core:v1.0.0-rc1'
+    annotationProcessor 'com.github.lemadane.recordmaster:recordmaster-processor:v1.0.0-rc1'
 }
 ```
 
@@ -86,7 +86,7 @@ Or for Maven:
     <dependency>
         <groupId>com.github.lemadane.recordmaster</groupId>
         <artifactId>recordmaster-core</artifactId>
-        <version>v1.0.0</version>
+        <version>v1.0.0-rc1</version>
     </dependency>
 </dependencies>
 ```
