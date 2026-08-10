@@ -2,7 +2,6 @@ package io.lemadane.recordmaster;
 
 import io.lemadane.recordmaster.annotations.Id;
 import io.lemadane.recordmaster.annotations.Index;
-
 import io.lemadane.recordmaster.core.CorruptWalException;
 import io.lemadane.recordmaster.core.RecordWalOperation;
 import io.lemadane.recordmaster.core.WalManager;
@@ -59,28 +58,33 @@ public class WalTornWriteE2ETest {
     @Test
     public void testTruncateInsidePayloadRecovery(@TempDir Path dbDir) throws Exception {
         try (RecordDatabase db = RecordDatabase.open(dbDir)) {
-            db.transaction(tx -> {
-                tx.table(AccountRecord.class).insert(new AccountRecord(1L, "user1@example.com", "Alice", 1000L));
-            });
-            db.transaction(tx -> {
-                tx.table(AccountRecord.class).insert(new AccountRecord(2L, "user2@example.com", "Bob with a very long payload message to test payload truncation", 2000L));
-            });
+            db.table(AccountRecord.class).insert(new AccountRecord(1L, "user1@example.com", "Alice", 1000L));
         }
 
         Path walFile = dbDir.resolve("wal.log");
         assertTrue(Files.exists(walFile));
-        long len = Files.size(walFile);
-        assertTrue(len > 50);
 
-        // Truncate 10 bytes off the end (lands inside the payload body)
-        try (FileChannel channel = FileChannel.open(walFile, StandardOpenOption.WRITE)) {
-            channel.truncate(len - 10);
+        byte[] largePayload = "Very long record payload for testing true payload truncation inside the record body".getBytes();
+        int payloadLen = largePayload.length;
+
+        // Append a raw INSERT record with valid 29-byte header + large payload directly to log
+        try (WalManager wal = new WalManager(dbDir, DurabilityMode.SYNC)) {
+            WalRecord rawInsert = new WalRecord(RecordWalOperation.INSERT, 200L, 2L, largePayload);
+            wal.appendRecordsDirect(List.of(rawInsert));
         }
 
-        // Reopen database and verify recovery truncates torn record and succeeds
+        long len = Files.size(walFile);
+
+        // Truncate at: total length - (payloadLen / 2) -> lands cleanly inside the payload body
+        long truncatePos = len - (payloadLen / 2);
+        try (FileChannel channel = FileChannel.open(walFile, StandardOpenOption.WRITE)) {
+            channel.truncate(truncatePos);
+        }
+
+        // Reopen database and verify recovery truncates incomplete payload torn write cleanly
         try (RecordDatabase db = RecordDatabase.open(dbDir)) {
             RecordTable<Long, AccountRecord> table = db.table(AccountRecord.class);
-            assertTrue(table.findById(1L).isPresent(), "First committed record must be intact");
+            assertTrue(table.findById(1L).isPresent(), "First committed transaction must be recovered intact");
         }
     }
 
