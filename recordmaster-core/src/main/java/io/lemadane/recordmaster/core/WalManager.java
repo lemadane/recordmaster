@@ -227,10 +227,6 @@ public final class WalManager implements AutoCloseable {
                 headerBuf.flip();
                 int magic = headerBuf.getInt();
                 if (magic != MAGIC) {
-                    if (fileChannel.position() == fileChannel.size()) {
-                        fileChannel.truncate(recordStartPos);
-                        break;
-                    }
                     throw new CorruptWalException("Corrupt WAL: Magic bytes mismatch in log file");
                 }
 
@@ -242,18 +238,10 @@ public final class WalManager implements AutoCloseable {
 
                 int maxRecordSize = 64 * 1024 * 1024; // 64 MB
                 if (payloadLen < 0 || payloadLen > maxRecordSize) {
-                    if (fileChannel.position() == fileChannel.size()) {
-                        fileChannel.truncate(recordStartPos);
-                        break;
-                    }
                     throw new CorruptWalException("Corrupt WAL: Invalid payload length " + payloadLen);
                 }
 
                 if (typeOrdinal >= RecordWalOperation.values().length) {
-                    if (fileChannel.position() == fileChannel.size()) {
-                        fileChannel.truncate(recordStartPos);
-                        break;
-                    }
                     throw new CorruptWalException("Corrupt WAL: Unknown operation type ordinal " + typeOrdinal);
                 }
 

@@ -45,10 +45,10 @@ public class ChaosE2ETest {
             process.destroyForcibly();
             process.waitFor(5, TimeUnit.SECONDS);
 
-            // 4. Randomly corrupt/truncate WAL tail to simulate sudden power loss during disk write
+            // 4. Randomly truncate or append torn header tail (<29 bytes) to simulate sudden power loss during disk write
             Path walFile = dbDir.resolve("wal.log");
             if (Files.exists(walFile) && random.nextBoolean()) {
-                byte[] corruptTail = new byte[random.nextInt(30) + 1];
+                byte[] corruptTail = new byte[random.nextInt(28) + 1]; // 1-28 bytes incomplete header torn write
                 random.nextBytes(corruptTail);
                 try (FileOutputStream fos = new FileOutputStream(walFile.toFile(), true)) {
                     fos.write(corruptTail);
