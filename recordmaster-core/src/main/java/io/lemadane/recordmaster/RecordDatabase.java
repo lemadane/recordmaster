@@ -10,11 +10,16 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.lang.reflect.Method;
 import java.lang.reflect.RecordComponent;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Function;
 
 public final class RecordDatabase implements AutoCloseable {
@@ -23,6 +28,7 @@ public final class RecordDatabase implements AutoCloseable {
     private final DurabilityMode durabilityMode;
     private final WalManager walManager;
     private final ReentrantLock writeLock = new ReentrantLock();
+    private final ReentrantReadWriteLock compactionLock = new ReentrantReadWriteLock();
     private final ExecutorService executor;
     private final ThreadLocal<RecordTransactionImpl> activeTransaction = new ThreadLocal<>();
 
@@ -32,6 +38,9 @@ public final class RecordDatabase implements AutoCloseable {
     private volatile Throwable lastPersistenceFailure;
     private volatile boolean closed = false;
     private final long databaseId;
+
+    private final FileChannel lockChannel;
+    private final FileLock lockFile;
 
     private record TableMetadata(
         String tableName,
@@ -45,9 +54,30 @@ public final class RecordDatabase implements AutoCloseable {
         this.durabilityMode = builder.durabilityMode();
         this.databaseId = new Random().nextLong() & Long.MAX_VALUE;
         this.executor = Executors.newVirtualThreadPerTaskExecutor();
-        this.walManager = new WalManager(directory, durabilityMode);
 
         try {
+            Files.createDirectories(directory);
+            Path lockPath = directory.resolve("recordmaster.lock");
+            this.lockChannel = FileChannel.open(lockPath, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
+            FileLock fl = null;
+            try {
+                fl = lockChannel.tryLock();
+            } catch (OverlappingFileLockException e) {
+                lockChannel.close();
+                throw new DatabaseAlreadyOpenException("Database directory is already locked by another instance in the same JVM process: " + directory.toAbsolutePath(), e);
+            }
+            if (fl == null) {
+                lockChannel.close();
+                throw new DatabaseAlreadyOpenException("Database directory is already locked by another process: " + directory.toAbsolutePath());
+            }
+            this.lockFile = fl;
+        } catch (IOException e) {
+            throw new DatabaseAlreadyOpenException("Failed to acquire exclusive file lock on database directory: " + directory.toAbsolutePath(), e);
+        }
+
+        try {
+            this.walManager = new WalManager(directory, durabilityMode);
+
             DatabaseState snapState = SnapshotManager.readSnapshot(directory, (tableName, ts, record, recBytes) -> {
                 TableStorage storage = getTableStorage(tableName);
                 if (ts.recordPointers().isEmpty()) {
@@ -82,8 +112,17 @@ public final class RecordDatabase implements AutoCloseable {
                     ts.tableName(), ts.idType(), ts.entityType(), ts.idExtractor()
                 ));
             }
+
+            walManager.setLastForcedGeneration(committedState.generation());
         } catch (Exception e) {
+            try {
+                if (lockFile != null && lockFile.isValid()) lockFile.release();
+                if (lockChannel != null && lockChannel.isOpen()) lockChannel.close();
+            } catch (Exception ex) {
+                // ignore cleanup errors
+            }
             this.lastPersistenceFailure = e;
+            if (e instanceof RuntimeException re) throw re;
             throw new RecordMasterException("Database startup recovery failed", e);
         }
     }
@@ -102,6 +141,14 @@ public final class RecordDatabase implements AutoCloseable {
 
     public WalManager getWalManager() {
         return walManager;
+    }
+
+    public ReentrantReadWriteLock.ReadLock getReadLock() {
+        return compactionLock.readLock();
+    }
+
+    public ReentrantLock getWriteLock() {
+        return writeLock;
     }
 
     public TableStorage getTableStorage(String tableName) {
@@ -195,14 +242,16 @@ public final class RecordDatabase implements AutoCloseable {
             TableMetadata meta = new TableMetadata(tableName, resolvedIdType, entityType, resolvedIdExtractor);
             tableMetadataMap.put(tableName, meta);
 
+            long schemaTxId = new Random().nextLong() & Long.MAX_VALUE;
             long nextGen = currentGeneration() + 1;
+
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             DataOutputStream dos = new DataOutputStream(baos);
             dos.writeUTF(tableName);
             dos.writeUTF(resolvedIdType.getName());
             dos.writeUTF(entityType.getName());
             dos.flush();
-            WalRecord createTableRec = new WalRecord(RecordWalOperation.CREATE_TABLE, databaseId, nextGen, baos.toByteArray());
+            WalRecord createTableRec = new WalRecord(RecordWalOperation.CREATE_TABLE, schemaTxId, nextGen, baos.toByteArray());
 
             List<WalRecord> schemaRecords = new ArrayList<>();
             schemaRecords.add(createTableRec);
@@ -212,13 +261,14 @@ public final class RecordDatabase implements AutoCloseable {
                 DataOutputStream idxDos = new DataOutputStream(idxBaos);
                 idxDos.writeUTF(tableName);
                 idxDos.writeUTF(idxMeta.indexName());
+                idxDos.writeUTF(idxMeta.fieldName());
                 idxDos.writeBoolean(idxMeta.unique());
                 idxDos.writeBoolean(idxMeta.ordered());
                 idxDos.flush();
-                schemaRecords.add(new WalRecord(RecordWalOperation.CREATE_INDEX, databaseId, nextGen, idxBaos.toByteArray()));
+                schemaRecords.add(new WalRecord(RecordWalOperation.CREATE_INDEX, schemaTxId, nextGen, idxBaos.toByteArray()));
             }
 
-            walManager.appendTransaction(databaseId, nextGen, schemaRecords);
+            walManager.appendTransaction(schemaTxId, nextGen, schemaRecords);
 
             TableState newTableState = new TableState(tableName, resolvedIdType, entityType, resolvedIdExtractor, indexMetadataList);
             DatabaseState nextState = committedState.copy(nextGen);
@@ -247,26 +297,35 @@ public final class RecordDatabase implements AutoCloseable {
                 Files.createDirectories(targetDir);
             }
 
-            // 1. Copy snapshot if exists
-            Path sourceSnapshot = directory.resolve("snapshot.bin");
-            if (Files.exists(sourceSnapshot)) {
-                Files.copy(sourceSnapshot, targetDir.resolve("snapshot.bin"), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            // 1. Force WAL to disk
+            walManager.flush();
+
+            // 2. Create/checkpoint snapshot of current state
+            SnapshotManager.writeSnapshot(directory, committedState, (tableName, key, ptr) -> getTableStorage(tableName).readRecord(ptr));
+
+            // 3. Copy snapshot file (snapshot.<gen>)
+            Path sourceSnapshot = findLatestSnapshot(directory);
+            if (sourceSnapshot != null && Files.exists(sourceSnapshot)) {
+                Files.copy(sourceSnapshot, targetDir.resolve(sourceSnapshot.getFileName()), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
             }
 
-            // 2. Copy WAL log if exists
+            // 4. Copy WAL log if exists
             Path sourceWal = directory.resolve("wal.log");
             if (Files.exists(sourceWal)) {
                 Files.copy(sourceWal, targetDir.resolve("wal.log"), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
             }
 
-            // 3. Copy table database files
+            // 5. Copy active table storage (.db) files
             for (String tableName : committedState.tables().keySet()) {
                 Path sourceTable = directory.resolve(tableName + ".db");
                 if (Files.exists(sourceTable)) {
                     Files.copy(sourceTable, targetDir.resolve(tableName + ".db"), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
                 }
             }
-        } catch (IOException e) {
+
+            // 6. Verify backup by reading snapshot integrity from targetDir
+            SnapshotManager.readSnapshot(targetDir, (tableName, ts, record, recBytes) -> {});
+        } catch (Exception e) {
             throw new RecordMasterException("Failed to perform hot backup to " + targetDir, e);
         } finally {
             writeLock.unlock();
@@ -283,13 +342,20 @@ public final class RecordDatabase implements AutoCloseable {
 
     @SuppressWarnings("unchecked")
     public <ID, T extends io.lemadane.recordmaster.Record> RecordTable<ID, T> table(Class<T> entityType) {
-        String tableName = getTableName(entityType);
-        TableMetadata meta = tableMetadataMap.get(tableName);
-        if (meta == null) {
-            registerTableMetadata(tableName, null, entityType, null);
-            meta = tableMetadataMap.get(tableName);
+        compactionLock.readLock().lock();
+        try {
+            String tableName = getTableName(entityType);
+            TableMetadata meta = tableMetadataMap.get(tableName);
+            if (meta == null) {
+                compactionLock.readLock().unlock();
+                registerTableMetadata(tableName, null, entityType, null);
+                compactionLock.readLock().lock();
+                meta = tableMetadataMap.get(tableName);
+            }
+            return new RecordTableImpl<>(tableName, (Class<ID>) meta.idType(), entityType, (Function<T, ID>) meta.idExtractor(), this);
+        } finally {
+            compactionLock.readLock().unlock();
         }
-        return new RecordTableImpl<>(tableName, (Class<ID>) meta.idType(), entityType, (Function<T, ID>) meta.idExtractor(), this);
     }
 
     @SuppressWarnings("unchecked")
@@ -376,22 +442,37 @@ public final class RecordDatabase implements AutoCloseable {
     }
 
     public Set<String> tableNames() {
-        return Collections.unmodifiableSet(committedState.tables().keySet());
+        compactionLock.readLock().lock();
+        try {
+            return Collections.unmodifiableSet(committedState.tables().keySet());
+        } finally {
+            compactionLock.readLock().unlock();
+        }
     }
 
     public boolean containsTable(String tableName) {
-        return committedState.tables().containsKey(tableName);
+        compactionLock.readLock().lock();
+        try {
+            return committedState.tables().containsKey(tableName);
+        } finally {
+            compactionLock.readLock().unlock();
+        }
     }
 
     @SuppressWarnings("unchecked")
     public Optional<RecordTable<?, ?>> findTable(String tableName) {
-        TableMetadata meta = tableMetadataMap.get(tableName);
-        if (meta == null) {
-            return Optional.empty();
+        compactionLock.readLock().lock();
+        try {
+            TableMetadata meta = tableMetadataMap.get(tableName);
+            if (meta == null) {
+                return Optional.empty();
+            }
+            @SuppressWarnings("rawtypes")
+            RecordTableImpl table = new RecordTableImpl(meta.tableName(), meta.idType(), meta.entityType(), meta.idExtractor(), this);
+            return Optional.of(table);
+        } finally {
+            compactionLock.readLock().unlock();
         }
-        @SuppressWarnings("rawtypes")
-        RecordTableImpl table = new RecordTableImpl(meta.tableName(), meta.idType(), meta.entityType(), meta.idExtractor(), this);
-        return Optional.of(table);
     }
 
     public boolean dropTable(String tableName) {
@@ -400,13 +481,15 @@ public final class RecordDatabase implements AutoCloseable {
             if (!containsTable(tableName)) {
                 return false;
             }
+            long schemaTxId = new Random().nextLong() & Long.MAX_VALUE;
             long nextGen = currentGeneration() + 1;
+
             ByteArrayOutputStream baos = new ByteArrayOutputStream();
             DataOutputStream dos = new DataOutputStream(baos);
             dos.writeUTF(tableName);
             dos.flush();
-            walManager.appendTransaction(databaseId, nextGen, List.of(
-                new WalRecord(RecordWalOperation.DROP_TABLE, databaseId, nextGen, baos.toByteArray())
+            walManager.appendTransaction(schemaTxId, nextGen, List.of(
+                new WalRecord(RecordWalOperation.DROP_TABLE, schemaTxId, nextGen, baos.toByteArray())
             ));
 
             DatabaseState nextState = committedState.copy(nextGen);
@@ -451,14 +534,30 @@ public final class RecordDatabase implements AutoCloseable {
         try {
             SnapshotManager.writeSnapshot(directory, committedState, (tableName, key, ptr) -> getTableStorage(tableName).readRecord(ptr));
             
-            // Compact storage files on disk
-            for (Map.Entry<String, TableState> entry : committedState.tables().entrySet()) {
-                String tableName = entry.getKey();
-                TableState ts = entry.getValue();
-                getTableStorage(tableName).compact(ts.recordPointers());
-            }
+            compactionLock.writeLock().lock();
+            try {
+                DatabaseState nextState = committedState.copy(committedState.generation());
 
-            walManager.truncate();
+                // Compact storage files on disk
+                for (Map.Entry<String, TableState> entry : committedState.tables().entrySet()) {
+                    String tableName = entry.getKey();
+                    TableState oldTs = entry.getValue();
+                    Map<Object, RecordPointer> newPointers = getTableStorage(tableName).compact(oldTs.recordPointers());
+                    
+                    TableState newTs = new TableState(oldTs.tableName(), oldTs.idType(), oldTs.entityType(), oldTs.idExtractor(), oldTs.indexMetadataList());
+                    newTs.recordPointers().putAll(newPointers);
+                    for (Map.Entry<String, IndexState> idxEntry : oldTs.indexes().entrySet()) {
+                        newTs.indexes().put(idxEntry.getKey(), idxEntry.getValue());
+                    }
+                    nextState.tables().put(tableName, newTs);
+                }
+
+                walManager.truncate();
+                walManager.setLastForcedGeneration(nextState.generation());
+                publish(nextState);
+            } finally {
+                compactionLock.writeLock().unlock();
+            }
         } catch (Exception e) {
             this.lastPersistenceFailure = e;
             throw new RecordMasterException("Database compaction failed", e);
@@ -468,6 +567,7 @@ public final class RecordDatabase implements AutoCloseable {
     }
 
     public void exportJson(Path destination) {
+        compactionLock.readLock().lock();
         try {
             DatabaseState stable = committedState;
             Map<String, List<Map<String, Object>>> jsonDb = new LinkedHashMap<>();
@@ -492,6 +592,8 @@ public final class RecordDatabase implements AutoCloseable {
             Files.writeString(destination, serialized);
         } catch (Exception e) {
             throw new RecordMasterException("JSON export failed", e);
+        } finally {
+            compactionLock.readLock().unlock();
         }
     }
 
@@ -567,7 +669,7 @@ public final class RecordDatabase implements AutoCloseable {
     }
 
     public long persistedGeneration() {
-        return currentGeneration();
+        return walManager.lastForcedGeneration();
     }
 
     public long snapshotGeneration() {
@@ -608,14 +710,31 @@ public final class RecordDatabase implements AutoCloseable {
     @Override
     public void close() {
         if (closed) return;
-        closed = true;
-        
-        for (TableStorage ts : tableStorageMap.values()) {
-            ts.close();
+        writeLock.lock();
+        try {
+            if (closed) return;
+            closed = true;
+            
+            for (TableStorage ts : tableStorageMap.values()) {
+                ts.close();
+            }
+            tableStorageMap.clear();
+            
+            executor.close();
+            walManager.close();
+
+            try {
+                if (lockFile != null && lockFile.isValid()) {
+                    lockFile.release();
+                }
+                if (lockChannel != null && lockChannel.isOpen()) {
+                    lockChannel.close();
+                }
+            } catch (Exception e) {
+                // ignore
+            }
+        } finally {
+            writeLock.unlock();
         }
-        tableStorageMap.clear();
-        
-        executor.close();
-        walManager.close();
     }
 }

@@ -72,6 +72,12 @@ public final class SnapshotManager {
         // Rename atomically
         Files.move(tmpPath, finalPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
 
+        try (java.nio.channels.FileChannel dirChannel = java.nio.channels.FileChannel.open(directory, java.nio.file.StandardOpenOption.READ)) {
+            dirChannel.force(true);
+        } catch (Exception e) {
+            // ignore if directory sync unsupported
+        }
+
         // Delete older snapshots
         try (var stream = Files.list(directory)) {
             stream.filter(p -> p.getFileName().toString().startsWith("snapshot."))
@@ -113,6 +119,9 @@ public final class SnapshotManager {
 
             long gen = dis.readLong();
             int tableCount = dis.readInt();
+            if (tableCount < 0 || tableCount > 100_000) {
+                throw new IOException("Corrupt snapshot: invalid table count " + tableCount);
+            }
 
             DatabaseState dbState = new DatabaseState(gen);
 
@@ -126,6 +135,9 @@ public final class SnapshotManager {
 
                 // Read index metadata
                 int indexCount = dis.readInt();
+                if (indexCount < 0 || indexCount > 10_000) {
+                    throw new IOException("Corrupt snapshot: invalid index count " + indexCount);
+                }
                 List<IndexMetadata> indexMetadataList = new ArrayList<>();
                 for (int i = 0; i < indexCount; i++) {
                     String idxName = dis.readUTF();
@@ -175,8 +187,14 @@ public final class SnapshotManager {
 
                 // Read records (read here to update checksum validation, we load them in the second pass)
                 int recordCount = dis.readInt();
+                if (recordCount < 0) {
+                    throw new IOException("Corrupt snapshot: invalid record count " + recordCount);
+                }
                 for (int r = 0; r < recordCount; r++) {
                     int len = dis.readInt();
+                    if (len < 0 || len > 64 * 1024 * 1024) {
+                        throw new IOException("Corrupt snapshot: invalid record byte length " + len);
+                    }
                     byte[] temp = new byte[len];
                     dis.readFully(temp);
                 }

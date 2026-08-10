@@ -1,0 +1,46 @@
+name: RecordMaster CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  schedule:
+    - cron: '0 0 * * *' # Scheduled daily soak test run
+
+jobs:
+  test:
+    name: Build, Test & Durability Harness (Java ${{ matrix.java-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java-version: [ '21', '25' ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java ${{ matrix.java-version }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ matrix.java-version }}
+          distribution: 'temurin'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build & Run Full Test Suite
+        run: ./gradlew build test --stacktrace
+
+      - name: Run High-Concurrency & Deadlock Tests
+        run: ./gradlew :recordmaster-core:test --tests "io.lemadane.recordmaster.DeadlockStressTest" --tests "io.lemadane.recordmaster.ConcurrentCompactionTest"
+
+      - name: Run SIGKILL Crash-Injection Harness
+        run: ./gradlew :recordmaster-core:test --tests "io.lemadane.recordmaster.CrashInjectionTest"
+
+      - name: Run Corruption & WAL Bounds Tests
+        run: ./gradlew :recordmaster-core:test --tests "io.lemadane.recordmaster.WalCorruptionTest"
+
+      - name: Run Stress & Soak Benchmark Suite
+        run: ./gradlew :recordmaster-core:stressTest --args="--records=50000 --threads=8"

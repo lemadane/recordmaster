@@ -53,72 +53,79 @@ public final class QueryEngine<T extends io.lemadane.recordmaster.Record> implem
     @Override
     @SuppressWarnings("unchecked")
     public List<T> list() {
-        Stream<io.lemadane.recordmaster.Record> stream;
-        if (staging != null && staging.isCleared()) {
-            stream = staging.getInserts().values().stream();
-        } else {
-            Stream<io.lemadane.recordmaster.Record> committedStream = committedTable != null ? 
-                    committedTable.recordPointers().entrySet().stream()
-                            .filter(e -> {
-                                Object key = e.getKey();
-                                if (staging != null) {
-                                    if (staging.getDeletes().contains(key)) return false;
-                                    if (staging.getUpdates().containsKey(key)) return false;
-                                    if (staging.getInserts().containsKey(key)) return false;
-                                }
-                                return true;
-                            })
-                            .map(e -> {
-                                try {
-                                    byte[] bytes = db.getTableStorage(tableName).readRecord(e.getValue());
-                                    return BinaryCodec.deserialize(bytes, committedTable.entityType());
-                                } catch (Exception ex) {
-                                    throw new RecordMasterException("Failed to read record from disk in query", ex);
-                                }
-                            }) : Stream.empty();
+        db.getReadLock().lock();
+        try {
+            TableState currentCommittedTable = db.getCommittedState().getTable(tableName);
 
-            Stream<io.lemadane.recordmaster.Record> stagedStream = staging != null ? 
-                    Stream.concat(staging.getInserts().values().stream(), staging.getUpdates().values().stream()) :
-                    Stream.empty();
+            Stream<io.lemadane.recordmaster.Record> stream;
+            if (staging != null && staging.isCleared()) {
+                stream = staging.getInserts().values().stream();
+            } else {
+                Stream<io.lemadane.recordmaster.Record> committedStream = currentCommittedTable != null ? 
+                        currentCommittedTable.recordPointers().entrySet().stream()
+                                .filter(e -> {
+                                    Object key = e.getKey();
+                                    if (staging != null) {
+                                        if (staging.getDeletes().contains(key)) return false;
+                                        if (staging.getUpdates().containsKey(key)) return false;
+                                        if (staging.getInserts().containsKey(key)) return false;
+                                    }
+                                    return true;
+                                })
+                                .map(e -> {
+                                    try {
+                                        byte[] bytes = db.getTableStorage(tableName).readRecord(e.getValue());
+                                        return BinaryCodec.deserialize(bytes, currentCommittedTable.entityType());
+                                    } catch (Exception ex) {
+                                        throw new RecordMasterException("Failed to read record from disk in query", ex);
+                                    }
+                                }) : Stream.empty();
 
-            stream = Stream.concat(committedStream, stagedStream);
-        }
+                Stream<io.lemadane.recordmaster.Record> stagedStream = staging != null ? 
+                        Stream.concat(staging.getInserts().values().stream(), staging.getUpdates().values().stream()) :
+                        Stream.empty();
 
-        for (Condition cond : conditions) {
-            stream = stream.filter(cond::test);
-        }
+                stream = Stream.concat(committedStream, stagedStream);
+            }
 
-        List<io.lemadane.recordmaster.Record> results = stream.collect(Collectors.toList());
+            for (Condition cond : conditions) {
+                stream = stream.filter(cond::test);
+            }
 
-        if (sortOrder != null) {
-            Field<?, ?> field = sortOrder.field();
-            Comparator<io.lemadane.recordmaster.Record> comparator = (r1, r2) -> {
-                try {
-                    Object val1 = ((Field<io.lemadane.recordmaster.Record, Object>) field).getter().apply(r1);
-                    Object val2 = ((Field<io.lemadane.recordmaster.Record, Object>) field).getter().apply(r2);
-                    if (val1 == null && val2 == null) return 0;
-                    if (val1 == null) return sortOrder.ascending() ? -1 : 1;
-                    if (val2 == null) return sortOrder.ascending() ? 1 : -1;
-                    if (val1 instanceof Comparable && val2.getClass().isInstance(val1)) {
-                        int cmp = ((Comparable<Object>) val1).compareTo(val2);
-                        return sortOrder.ascending() ? cmp : -cmp;
+            List<io.lemadane.recordmaster.Record> results = stream.collect(Collectors.toList());
+
+            if (sortOrder != null) {
+                Field<?, ?> field = sortOrder.field();
+                Comparator<io.lemadane.recordmaster.Record> comparator = (r1, r2) -> {
+                    try {
+                        Object val1 = ((Field<io.lemadane.recordmaster.Record, Object>) field).getter().apply(r1);
+                        Object val2 = ((Field<io.lemadane.recordmaster.Record, Object>) field).getter().apply(r2);
+                        if (val1 == null && val2 == null) return 0;
+                        if (val1 == null) return sortOrder.ascending() ? -1 : 1;
+                        if (val2 == null) return sortOrder.ascending() ? 1 : -1;
+                        if (val1 instanceof Comparable && val2.getClass().isInstance(val1)) {
+                            int cmp = ((Comparable<Object>) val1).compareTo(val2);
+                            return sortOrder.ascending() ? cmp : -cmp;
+                        }
+                        return 0;
+                    } catch (Exception e) {
+                        return 0;
                     }
-                    return 0;
-                } catch (Exception e) {
-                    return 0;
-                }
-            };
-            results.sort(comparator);
-        }
+                };
+                results.sort(comparator);
+            }
 
-        int fromIndex = Math.min(offset, results.size());
-        int toIndex = limit < 0 ? results.size() : Math.min(fromIndex + limit, results.size());
-        
-        List<T> finalResults = new ArrayList<>();
-        for (int i = fromIndex; i < toIndex; i++) {
-            finalResults.add((T) results.get(i));
+            int fromIndex = Math.min(offset, results.size());
+            int toIndex = limit < 0 ? results.size() : Math.min(fromIndex + limit, results.size());
+            
+            List<T> finalResults = new ArrayList<>();
+            for (int i = fromIndex; i < toIndex; i++) {
+                finalResults.add((T) results.get(i));
+            }
+            return finalResults;
+        } finally {
+            db.getReadLock().unlock();
         }
-        return finalResults;
     }
 
     @Override

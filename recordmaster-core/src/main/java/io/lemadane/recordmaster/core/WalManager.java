@@ -30,7 +30,7 @@ public final class WalManager implements AutoCloseable {
     private final ConcurrentSkipListMap<Long, CompletableFuture<Void>> pendingFlushes = new ConcurrentSkipListMap<>();
     private final ReentrantLock flushLock = new ReentrantLock();
     private final Condition flushCondition = flushLock.newCondition();
-    private volatile long lastFlushedGeneration = 0;
+    private volatile long lastForcedGeneration = 0;
 
     public WalManager(Path directory, DurabilityMode durabilityMode) {
         this.walPath = directory.resolve("wal.log");
@@ -52,6 +52,14 @@ public final class WalManager implements AutoCloseable {
         if (durabilityMode == DurabilityMode.BATCHED) {
             startBatchedFlusher();
         }
+    }
+
+    public long lastForcedGeneration() {
+        return lastForcedGeneration;
+    }
+
+    public void setLastForcedGeneration(long generation) {
+        this.lastForcedGeneration = generation;
     }
 
     public void appendTransaction(long transactionId, long generation, List<WalRecord> records) {
@@ -86,6 +94,7 @@ public final class WalManager implements AutoCloseable {
 
             if (durabilityMode == DurabilityMode.SYNC) {
                 fileChannel.force(false);
+                lastForcedGeneration = Math.max(lastForcedGeneration, generation);
             } else if (durabilityMode == DurabilityMode.BATCHED) {
                 future = new CompletableFuture<>();
                 pendingFlushes.put(generation, future);
@@ -112,6 +121,25 @@ public final class WalManager implements AutoCloseable {
         }
     }
 
+    public void appendRecordsDirect(List<WalRecord> records) throws IOException {
+        writeLock.lock();
+        try {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            DataOutputStream dos = new DataOutputStream(baos);
+            for (WalRecord rec : records) {
+                writeRecordToBuffer(dos, rec);
+            }
+            dos.flush();
+            ByteBuffer buf = ByteBuffer.wrap(baos.toByteArray());
+            while (buf.hasRemaining()) {
+                fileChannel.write(buf);
+            }
+            fileChannel.force(false);
+        } finally {
+            writeLock.unlock();
+        }
+    }
+
     public void appendRollbackMarker(long transactionId, long generation, String reason) {
         writeLock.lock();
         try {
@@ -127,6 +155,7 @@ public final class WalManager implements AutoCloseable {
             }
             if (durabilityMode == DurabilityMode.SYNC) {
                 fileChannel.force(false);
+                lastForcedGeneration = Math.max(lastForcedGeneration, generation);
             }
         } catch (IOException e) {
             // Ignore failures for rollback diagnostics, as it is non-blocking and best effort.
@@ -173,24 +202,25 @@ public final class WalManager implements AutoCloseable {
 
             while (true) {
                 headerBuf.clear();
+                long recordStartPos = fileChannel.position();
                 int read = readFully(fileChannel, headerBuf);
                 if (read == 0) {
                     break; // EOF
                 }
                 if (read < 29) {
-                    // Truncated header at end of file - safe to ignore
+                    // Truncated header at end of file - safe to truncate to last valid position
+                    fileChannel.truncate(recordStartPos);
                     break;
                 }
 
                 headerBuf.flip();
                 int magic = headerBuf.getInt();
                 if (magic != MAGIC) {
-                    // If magic doesn't match and we are at the end, treat as truncated.
-                    // If there is more data, it's middle corruption.
                     if (fileChannel.position() == fileChannel.size()) {
+                        fileChannel.truncate(recordStartPos);
                         break;
                     }
-                    throw new IOException("Corrupt WAL: Magic bytes mismatch in middle of log file");
+                    throw new CorruptWalException("Corrupt WAL: Magic bytes mismatch in log file");
                 }
 
                 int typeOrdinal = headerBuf.get() & 0xFF;
@@ -199,39 +229,48 @@ public final class WalManager implements AutoCloseable {
                 int payloadLen = headerBuf.getInt();
                 int checksum = headerBuf.getInt();
 
-                if (typeOrdinal >= RecordWalOperation.values().length) {
-                    throw new IOException("Corrupt WAL: Unknown operation type ordinal " + typeOrdinal);
+                int maxRecordSize = 64 * 1024 * 1024; // 64 MB
+                if (payloadLen < 0 || payloadLen > maxRecordSize) {
+                    if (fileChannel.position() == fileChannel.size()) {
+                        fileChannel.truncate(recordStartPos);
+                        break;
+                    }
+                    throw new CorruptWalException("Corrupt WAL: Invalid payload length " + payloadLen);
                 }
-                RecordWalOperation type = RecordWalOperation.values()[typeOrdinal];
 
+                if (typeOrdinal >= RecordWalOperation.values().length) {
+                    if (fileChannel.position() == fileChannel.size()) {
+                        fileChannel.truncate(recordStartPos);
+                        break;
+                    }
+                    throw new CorruptWalException("Corrupt WAL: Unknown operation type ordinal " + typeOrdinal);
+                }
+
+                RecordWalOperation type = RecordWalOperation.values()[typeOrdinal];
                 byte[] payload = new byte[payloadLen];
                 ByteBuffer payloadBuf = ByteBuffer.wrap(payload);
                 int payloadRead = readFully(fileChannel, payloadBuf);
-
                 if (payloadRead < payloadLen) {
-                    // Truncated payload at end of file - ignore
+                    fileChannel.truncate(recordStartPos);
                     break;
                 }
 
-                // Verify checksum
                 CRC32C crc = new CRC32C();
                 crc.update(typeOrdinal);
-                
-                ByteBuffer temp = ByteBuffer.allocate(16);
-                temp.putLong(txId);
-                temp.putLong(gen);
-                crc.update(temp.array(), 0, 16);
-                
-                if (payloadLen > 0) {
-                    crc.update(payload, 0, payloadLen);
-                }
+                byte[] txIdBytes = new byte[8];
+                ByteBuffer.wrap(txIdBytes).putLong(txId);
+                crc.update(txIdBytes);
+                byte[] genBytes = new byte[8];
+                ByteBuffer.wrap(genBytes).putLong(gen);
+                crc.update(genBytes);
+                crc.update(payload);
 
                 if ((int) crc.getValue() != checksum) {
-                    // Check if this is the last record in the file. If yes, ignore as truncated.
                     if (fileChannel.position() == fileChannel.size()) {
+                        fileChannel.truncate(recordStartPos);
                         break;
                     }
-                    throw new IOException("Corrupt WAL: Checksum mismatch in middle of log file");
+                    throw new CorruptWalException("Corrupt WAL: Checksum mismatch in log file");
                 }
 
                 records.add(new WalRecord(type, txId, gen, payload));
@@ -259,7 +298,8 @@ public final class WalManager implements AutoCloseable {
         try {
             fileChannel.truncate(0);
             fileChannel.position(0);
-            lastFlushedGeneration = 0;
+            fileChannel.force(true);
+            lastForcedGeneration = 0;
         } finally {
             writeLock.unlock();
         }
@@ -293,13 +333,13 @@ public final class WalManager implements AutoCloseable {
             if (closed) return;
             fileChannel.force(false);
             
-            long maxFlushedGen = lastFlushedGeneration;
+            long maxFlushedGen = lastForcedGeneration;
             Map.Entry<Long, CompletableFuture<Void>> lastEntry = pendingFlushes.lastEntry();
             if (lastEntry != null) {
                 maxFlushedGen = lastEntry.getKey();
             }
 
-            lastFlushedGeneration = maxFlushedGen;
+            lastForcedGeneration = maxFlushedGen;
 
             // Complete all futures <= maxFlushedGen
             while (!pendingFlushes.isEmpty()) {
@@ -331,7 +371,7 @@ public final class WalManager implements AutoCloseable {
         try {
             if (closed) return;
             fileChannel.force(false);
-            lastFlushedGeneration = Long.MAX_VALUE;
+            lastForcedGeneration = Long.MAX_VALUE;
             // Complete all pending futures
             while (!pendingFlushes.isEmpty()) {
                 Map.Entry<Long, CompletableFuture<Void>> entry = pendingFlushes.pollFirstEntry();
@@ -351,9 +391,17 @@ public final class WalManager implements AutoCloseable {
         writeLock.lock();
         try {
             if (closed) return;
-            closed = true;
             executor.shutdownNow();
-            flush();
+            // Force remaining unwritten bytes to disk BEFORE setting closed = true
+            try {
+                if (fileChannel != null && fileChannel.isOpen()) {
+                    fileChannel.force(false);
+                    lastForcedGeneration = Long.MAX_VALUE;
+                }
+            } catch (IOException e) {
+                // ignore
+            }
+            closed = true;
             if (fileChannel != null) {
                 fileChannel.close();
             }

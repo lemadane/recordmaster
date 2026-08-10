@@ -18,7 +18,7 @@ public final class TableState {
         this.idType = idType;
         this.entityType = entityType;
         this.idExtractor = idExtractor;
-        this.recordPointers = new LinkedHashMap<>();
+        this.recordPointers = new java.util.concurrent.ConcurrentHashMap<>();
         this.indexes = new HashMap<>();
         this.indexMetadataList = indexMetadataList;
         for (IndexMetadata meta : indexMetadataList) {
@@ -31,7 +31,7 @@ public final class TableState {
         this.idType = idType;
         this.entityType = entityType;
         this.idExtractor = idExtractor;
-        this.recordPointers = recordPointers;
+        this.recordPointers = new java.util.concurrent.ConcurrentHashMap<>(recordPointers);
         this.indexes = indexes;
         this.indexMetadataList = indexMetadataList;
     }
@@ -66,7 +66,7 @@ public final class TableState {
     }
 
     public TableState copy() {
-        Map<Object, RecordPointer> newRecordPointers = new LinkedHashMap<>(this.recordPointers);
+        Map<Object, RecordPointer> newRecordPointers = new java.util.concurrent.ConcurrentHashMap<>(this.recordPointers);
         Map<String, IndexState> newIndexes = new HashMap<>();
         for (Map.Entry<String, IndexState> entry : this.indexes.entrySet()) {
             newIndexes.put(entry.getKey(), entry.getValue().copy());

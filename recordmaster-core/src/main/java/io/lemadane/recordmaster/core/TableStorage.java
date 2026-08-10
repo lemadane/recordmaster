@@ -72,7 +72,7 @@ public final class TableStorage {
      *                       This map will be updated in-place with the new offsets.
      * @throws IOException if a file access error occurs
      */
-    public synchronized void compact(Map<Object, RecordPointer> activePointers) throws IOException {
+    public synchronized Map<Object, RecordPointer> compact(Map<Object, RecordPointer> activePointers) throws IOException {
         Path compactPath = tablePath.getParent().resolve(tablePath.getFileName() + ".compact");
         Files.deleteIfExists(compactPath);
 
@@ -113,9 +113,8 @@ public final class TableStorage {
                     StandardOpenOption.WRITE);
             this.currentSize = writeOffset;
 
-            // Update in-memory pointers map in-place
-            activePointers.clear();
-            activePointers.putAll(newPointers);
+            return newPointers;
         }
     }
 }
+

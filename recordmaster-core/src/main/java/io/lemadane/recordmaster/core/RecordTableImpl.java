@@ -98,19 +98,24 @@ public final class RecordTableImpl<ID, T extends io.lemadane.recordmaster.Record
             }
             return Optional.empty();
         } else {
-            TableState committed = db.getCommittedState().getTable(tableName);
-            if (committed != null) {
-                RecordPointer ptr = committed.recordPointers().get(id);
-                if (ptr != null) {
-                    try {
-                        byte[] bytes = db.getTableStorage(tableName).readRecord(ptr);
-                        return Optional.of((T) BinaryCodec.deserialize(bytes, entityType));
-                    } catch (Exception e) {
-                        throw new RecordMasterException("Failed to read record from disk", e);
+            db.getReadLock().lock();
+            try {
+                TableState committed = db.getCommittedState().getTable(tableName);
+                if (committed != null) {
+                    RecordPointer ptr = committed.recordPointers().get(id);
+                    if (ptr != null) {
+                        try {
+                            byte[] bytes = db.getTableStorage(tableName).readRecord(ptr);
+                            return Optional.of((T) BinaryCodec.deserialize(bytes, entityType));
+                        } catch (Exception e) {
+                            throw new RecordMasterException("Failed to read record from disk", e);
+                        }
                     }
                 }
+                return Optional.empty();
+            } finally {
+                db.getReadLock().unlock();
             }
-            return Optional.empty();
         }
     }
 

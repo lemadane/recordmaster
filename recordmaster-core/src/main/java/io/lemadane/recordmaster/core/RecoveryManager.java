@@ -18,35 +18,35 @@ public final class RecoveryManager {
             return initialState != null ? initialState : new DatabaseState(0);
         }
 
-        // Group records by transactionId
-        Map<Long, List<WalRecord>> txGroups = new LinkedHashMap<>();
-        Set<Long> committedTxIds = new LinkedHashSet<>();
-        Set<Long> rolledBackTxIds = new LinkedHashSet<>();
+        // Group records by (transactionId, generation) composite key
+        record TxKey(long txId, long generation) {}
+
+        Map<TxKey, List<WalRecord>> txGroups = new LinkedHashMap<>();
+        Set<TxKey> committedTxKeys = new LinkedHashSet<>();
+        Set<TxKey> rolledBackTxKeys = new LinkedHashSet<>();
 
         for (WalRecord rec : walRecords) {
-            txGroups.computeIfAbsent(rec.transactionId(), k -> new ArrayList<>()).add(rec);
+            TxKey key = new TxKey(rec.transactionId(), rec.generation());
+            txGroups.computeIfAbsent(key, k -> new ArrayList<>()).add(rec);
             if (rec.type() == RecordWalOperation.COMMIT_TRANSACTION) {
-                committedTxIds.add(rec.transactionId());
+                committedTxKeys.add(key);
             } else if (rec.type() == RecordWalOperation.ROLLBACK_TRANSACTION) {
-                rolledBackTxIds.add(rec.transactionId());
+                rolledBackTxKeys.add(key);
             }
         }
 
         // We only replay transactions that have committed and not rolled back.
-        committedTxIds.removeAll(rolledBackTxIds);
+        committedTxKeys.removeAll(rolledBackTxKeys);
 
         // Sort committed transactions by their generation
-        List<Long> sortedTxIds = new ArrayList<>(committedTxIds);
-        sortedTxIds.sort(Comparator.comparingLong(txId -> {
-            List<WalRecord> recs = txGroups.get(txId);
-            return recs.isEmpty() ? 0L : recs.get(0).generation();
-        }));
+        List<TxKey> sortedTxKeys = new ArrayList<>(committedTxKeys);
+        sortedTxKeys.sort(Comparator.comparingLong(TxKey::generation));
 
         DatabaseState dbState = initialState != null ? initialState.copy(initialState.generation()) : new DatabaseState(0);
         long currentGen = dbState.generation();
 
-        for (long txId : sortedTxIds) {
-            List<WalRecord> recs = txGroups.get(txId);
+        for (TxKey txKey : sortedTxKeys) {
+            List<WalRecord> recs = txGroups.get(txKey);
             for (WalRecord rec : recs) {
                 currentGen = Math.max(currentGen, rec.generation());
                 
@@ -138,33 +138,34 @@ public final class RecoveryManager {
                         case CREATE_INDEX: {
                             String tableName = dis.readUTF();
                             String idxName = dis.readUTF();
+                            String fieldName = dis.readUTF();
                             boolean unique = dis.readBoolean();
                             boolean ordered = dis.readBoolean();
 
                             TableState ts = dbState.getTable(tableName);
                             if (ts != null) {
-                                // Add index metadata
-                                String fieldName = idxName.substring((tableName + "_").length(), idxName.length() - "_idx".length());
-                                java.lang.reflect.Method accessor = ts.entityType().getMethod(fieldName);
-                                accessor.setAccessible(true);
-                                Function<Record, Object> extractor = r -> {
-                                    try {
-                                        return accessor.invoke(r);
-                                    } catch (Exception e) {
-                                        throw new RuntimeException(e);
+                                if (!ts.indexes().containsKey(idxName)) {
+                                    java.lang.reflect.Method accessor = ts.entityType().getMethod(fieldName);
+                                    accessor.setAccessible(true);
+                                    Function<Record, Object> extractor = r -> {
+                                        try {
+                                            return accessor.invoke(r);
+                                        } catch (Exception e) {
+                                            throw new RuntimeException(e);
+                                        }
+                                    };
+
+                                    IndexMetadata meta = new IndexMetadata(idxName, fieldName, unique, ordered, extractor);
+                                    ts.indexMetadataList().add(meta);
+                                    ts.indexes().put(idxName, new IndexState(meta));
+
+                                    // Re-populate index for existing records
+                                    IndexState idxState = ts.indexes().get(idxName);
+                                    for (Map.Entry<Object, RecordPointer> entry : ts.recordPointers().entrySet()) {
+                                        Record record = helper.readRecord(tableName, entry.getKey(), entry.getValue(), ts.entityType());
+                                        Object val = extractor.apply(record);
+                                        idxState.add(val, entry.getKey());
                                     }
-                                };
-
-                                IndexMetadata meta = new IndexMetadata(idxName, fieldName, unique, ordered, extractor);
-                                ts.indexMetadataList().add(meta);
-                                ts.indexes().put(idxName, new IndexState(meta));
-
-                                // Re-populate index for existing records
-                                IndexState idxState = ts.indexes().get(idxName);
-                                for (Map.Entry<Object, RecordPointer> entry : ts.recordPointers().entrySet()) {
-                                    Record record = helper.readRecord(tableName, entry.getKey(), entry.getValue(), ts.entityType());
-                                    Object val = extractor.apply(record);
-                                    idxState.add(val, entry.getKey());
                                 }
                             }
                             break;
@@ -212,37 +213,8 @@ public final class RecoveryManager {
             }
         };
 
-        // Scan for @Index and @Indexes annotations
-        List<IndexMetadata> indexMetadataList = new ArrayList<>();
-        for (java.lang.reflect.RecordComponent comp : entityType.getRecordComponents()) {
-            String fieldName = comp.getName();
-            java.lang.reflect.Method accessor = comp.getAccessor();
-            accessor.setAccessible(true);
-            Function<Record, Object> extractor = r -> {
-                try {
-                    return accessor.invoke(r);
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
-                }
-            };
-
-            List<io.lemadane.recordmaster.annotations.Index> idxAnnots = new ArrayList<>();
-            if (comp.isAnnotationPresent(io.lemadane.recordmaster.annotations.Index.class)) {
-                idxAnnots.add(comp.getAnnotation(io.lemadane.recordmaster.annotations.Index.class));
-            }
-            if (comp.isAnnotationPresent(io.lemadane.recordmaster.annotations.Indexes.class)) {
-                idxAnnots.addAll(Arrays.asList(comp.getAnnotation(io.lemadane.recordmaster.annotations.Indexes.class).value()));
-            }
-
-            for (io.lemadane.recordmaster.annotations.Index idx : idxAnnots) {
-                String name = idx.name();
-                if (name.isEmpty()) {
-                    name = tableName + "_" + fieldName + "_idx";
-                }
-                indexMetadataList.add(new IndexMetadata(name, fieldName, idx.unique(), idx.ordered(), extractor));
-            }
-        }
-
-        return new TableState(tableName, idAccessor.getReturnType(), entityType, idExtractor, indexMetadataList);
+        // Return table state with empty initial index list.
+        // Indexes will be created explicitly via CREATE_INDEX WAL records.
+        return new TableState(tableName, idAccessor.getReturnType(), entityType, idExtractor, new ArrayList<>());
     }
 }
