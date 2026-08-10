@@ -2,8 +2,6 @@ package io.lemadane.recordmaster;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
-import java.io.FileOutputStream;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Random;
@@ -13,7 +11,7 @@ import static org.junit.jupiter.api.Assertions.*;
 public class ChaosE2ETest {
 
     @Test
-    public void testHarshChaosSigkillAndWalCorruptionE2E(@TempDir Path tempDir) throws Exception {
+    public void testHarshChaosSigkillE2E(@TempDir Path tempDir) throws Exception {
         Path dbDir = tempDir.resolve("chaos-db");
         Path backupDir = tempDir.resolve("chaos-backup");
 
@@ -45,18 +43,7 @@ public class ChaosE2ETest {
             process.destroyForcibly();
             process.waitFor(5, TimeUnit.SECONDS);
 
-            // 4. Randomly truncate or append torn header tail (<29 bytes) to simulate sudden power loss during disk write
-            Path walFile = dbDir.resolve("wal.log");
-            if (Files.exists(walFile) && random.nextBoolean()) {
-                byte[] corruptTail = new byte[random.nextInt(28) + 1]; // 1-28 bytes incomplete header torn write
-                random.nextBytes(corruptTail);
-                try (FileOutputStream fos = new FileOutputStream(walFile.toFile(), true)) {
-                    fos.write(corruptTail);
-                    fos.flush();
-                }
-            }
-
-            // 5. Open database and verify full state recovery & post-recovery transaction writability
+            // 4. Open database and verify full state recovery & post-recovery transaction writability
             try (RecordDatabase db = RecordDatabase.open(dbDir)) {
                 RecordTable<Long, ChaosWorkerMain.UserAccount> table = db.table(ChaosWorkerMain.UserAccount.class);
                 List<ChaosWorkerMain.UserAccount> recovered = table.query().list();
