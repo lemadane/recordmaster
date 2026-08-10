@@ -492,17 +492,22 @@ public final class RecordDatabase implements AutoCloseable {
                 new WalRecord(RecordWalOperation.DROP_TABLE, schemaTxId, nextGen, baos.toByteArray())
             ));
 
-            DatabaseState nextState = committedState.copy(nextGen);
-            nextState.tables().remove(tableName);
-            publish(nextState);
-            tableMetadataMap.remove(tableName);
-            
-            // Delete table storage
-            TableStorage storage = tableStorageMap.remove(tableName);
-            if (storage != null) {
-                storage.close();
+            compactionLock.writeLock().lock();
+            try {
+                DatabaseState nextState = committedState.copy(nextGen);
+                nextState.tables().remove(tableName);
+                publish(nextState);
+                tableMetadataMap.remove(tableName);
+                
+                // Delete table storage
+                TableStorage storage = tableStorageMap.remove(tableName);
+                if (storage != null) {
+                    storage.close();
+                }
+                Files.deleteIfExists(directory.resolve(tableName + ".db"));
+            } finally {
+                compactionLock.writeLock().unlock();
             }
-            Files.deleteIfExists(directory.resolve(tableName + ".db"));
 
             return true;
         } catch (Exception e) {
@@ -513,10 +518,16 @@ public final class RecordDatabase implements AutoCloseable {
     }
 
     public CompletionStage<Void> flushAsync() {
-        return CompletableFuture.runAsync(this::flush, executor);
+        if (closed) return CompletableFuture.completedFuture(null);
+        try {
+            return CompletableFuture.runAsync(this::flush, executor);
+        } catch (RejectedExecutionException e) {
+            return CompletableFuture.completedFuture(null);
+        }
     }
 
     public void flush() {
+        if (closed) return;
         try {
             walManager.flush();
         } catch (Exception e) {
@@ -526,12 +537,19 @@ public final class RecordDatabase implements AutoCloseable {
     }
 
     public CompletionStage<Void> compactAsync() {
-        return CompletableFuture.runAsync(this::compact, executor);
+        if (closed) return CompletableFuture.completedFuture(null);
+        try {
+            return CompletableFuture.runAsync(this::compact, executor);
+        } catch (RejectedExecutionException e) {
+            return CompletableFuture.completedFuture(null);
+        }
     }
 
     public void compact() {
+        if (closed) return;
         writeLock.lock();
         try {
+            if (closed) return;
             SnapshotManager.writeSnapshot(directory, committedState, (tableName, key, ptr) -> getTableStorage(tableName).readRecord(ptr));
             
             compactionLock.writeLock().lock();
@@ -721,25 +739,25 @@ public final class RecordDatabase implements AutoCloseable {
                     ts.close();
                 }
                 tableStorageMap.clear();
-                
-                executor.close();
-                walManager.close();
-
-                try {
-                    if (lockFile != null && lockFile.isValid()) {
-                        lockFile.release();
-                    }
-                    if (lockChannel != null && lockChannel.isOpen()) {
-                        lockChannel.close();
-                    }
-                } catch (Exception e) {
-                    // ignore
-                }
             } finally {
                 compactionLock.writeLock().unlock();
             }
         } finally {
             writeLock.unlock();
+        }
+
+        executor.close();
+        walManager.close();
+
+        try {
+            if (lockFile != null && lockFile.isValid()) {
+                lockFile.release();
+            }
+            if (lockChannel != null && lockChannel.isOpen()) {
+                lockChannel.close();
+            }
+        } catch (Exception e) {
+            // ignore
         }
     }
 }

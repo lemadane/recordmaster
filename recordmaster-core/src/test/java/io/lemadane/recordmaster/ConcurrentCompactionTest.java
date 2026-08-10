@@ -78,4 +78,19 @@ public class ConcurrentCompactionTest {
             assertEquals(initialCount, table.query().list().size());
         }
     }
+
+    @Test
+    public void testCloseDuringCompactAsync(@TempDir Path dbDir) throws Exception {
+        RecordDatabase db = RecordDatabase.open(dbDir);
+        RecordTable<Long, TestRecord> table = db.table(TestRecord.class);
+        table.insert(new TestRecord(1L, "test@example.com", "Test User"));
+
+        // Trigger compactAsync and immediately call db.close() concurrently
+        CompletableFuture<Void> compactFuture = db.compactAsync().toCompletableFuture();
+        db.close();
+
+        // Must complete without deadlocking
+        assertDoesNotThrow(() -> compactFuture.get(3, TimeUnit.SECONDS));
+        assertTrue(db.isClosed());
+    }
 }

@@ -319,13 +319,13 @@ public final class WalManager implements AutoCloseable {
                 flushLock.lock();
                 try {
                     flushCondition.await(10, TimeUnit.MILLISECONDS);
-                    flushPending();
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
                 } finally {
                     flushLock.unlock();
                 }
+                flushPending();
             }
             flushPending();
         });
